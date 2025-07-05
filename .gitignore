@@ -1,7 +1,6 @@
 data/
 figures/
 point_clouds/
-meshes/
 
 __pycache__*
 *.pyc

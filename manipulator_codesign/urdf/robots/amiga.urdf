@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<robot name="amiga" xmlns="http://www.ros.org/schema/robot">
+  <!-- Body link: visual mesh + three box collisions + inertial -->
+  <link name="amiga__body">
+    <!-- Visual: STL mesh -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="/home/marcus/IMML/manipulator_codesign/external/pybullet_robokit/pybullet_robokit/meshes/frame_on_amiga_v2_simplified.stl"/>
+      </geometry>
+      <material name="LightLightGrey">
+        <color rgba="0.941 0.941 0.941 1.0"/>
+      </material>
+    </visual>
+
+    <!-- Collision 0: large box under the mesh -->
+    <collision>
+      <origin xyz="0 0 0.499053035" rpy="0 0 0"/>
+      <geometry>
+        <box size="1.132 0.800 0.99810607"/>
+      </geometry>
+    </collision>
+
+    <!-- Collision 1: smaller box offset in Y and Z -->
+    <collision>
+      <origin xyz="0 -0.12 0.99810607" rpy="0 0 0"/>
+      <geometry>
+        <box size="1.132 0.6 0.2"/>
+      </geometry>
+    </collision>
+
+    <!-- Collision 2: small box offset in X, Y, and Z -->
+    <collision>
+      <origin xyz="0.441 0.083333333 1.19810607" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.25 0.25 0.25"/>
+      </geometry>
+    </collision>
+
+    <!-- Inertial based on a 40 kg body approximated by the first collision box -->
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="40.0"/>
+      <inertia
+        ixx="5.454052423236149"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="7.592132423236148"
+        iyz="0.0"
+        izz="6.404746666666665"/>
+    </inertial>
+  </link>
+
+</robot>
