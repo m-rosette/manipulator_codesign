@@ -157,7 +157,8 @@ class Evaluator:
     def evaluate(self, x, targets, targets_offset,
                  robot_translation, min_j, max_j,
                  alpha, beta, delta, gamma):
-        p = self.p       
+        p = self.p    
+        p.setGravity(0, 0, -9.81)   
 
         # load robot
         object_loader = LoadObjects(p)
@@ -187,6 +188,10 @@ class Evaluator:
         if not ch.is_built:
             ch.build_robot()
         ch.load_robot()
+
+        targets = ch.sample_collision_free_poses(targets)
+        targets_offset = ch.sample_collision_free_poses(targets_offset)
+
         ch.compute_chain_metrics(targets, targets_offset)
 
         # cleanup
@@ -206,9 +211,9 @@ class Evaluator:
 # -------- Problem Definition --------
 class KinematicChainProblem(Problem):
     def __init__(self, targets, targets_offset, robot_translation, mobile_base_translation,
-                 seeds, min_joints=2, max_joints=7,
+                 seeds, dec_vec_bounds, min_joints=2, max_joints=7,
                  alpha=1, beta=1, delta=1, gamma=1,
-                 cal_samples=15, num_actors=4):
+                 cal_samples=15, num_actors=4, num_objectives=6):
         print("[KinematicChainProblem] Initializing and calibrating...")
         self.targets = targets
         self.targets_offset = targets_offset
@@ -217,16 +222,15 @@ class KinematicChainProblem(Problem):
         self.min_joints, self.max_joints = min_joints, max_joints
         self.alpha, self.beta, self.delta, self.gamma = alpha, beta, delta, gamma
 
-        xl = [min_joints] + [0,0,0.05] * max_joints
-        xu = [max_joints] + [2,2,0.75] * max_joints
-        super().__init__(n_var=len(xl), n_obj=6, xl=np.array(xl), xu=np.array(xu))
+        xl = dec_vec_bounds[0]
+        xu = dec_vec_bounds[1]
+
+        super().__init__(n_var=len(xl), n_obj=num_objectives, xl=np.array(xl), xu=np.array(xu))
 
         self._x_cal = self._make_calibration_batch(seeds, cal_samples)
 
         # create a pool of Evaluator actors
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # mesh_path = "manipulator_codesign/manipulator_codesign/meshes/before_mesh_transformed.obj"
-        # robot_urdf = "manipulator_codesign/manipulator_codesign/urdf/robots/amiga.urdf"
         mesh_path = os.path.join(script_dir, "meshes", "before_mesh_transformed.obj")
         robot_urdf = os.path.join(script_dir, "urdf", "robots", "amiga.urdf")
         flags = 0
@@ -371,12 +375,39 @@ if __name__ == "__main__":
     use_wandb = args.wandb
     use_mixed = args.mixed
 
-    ray.init(num_cpus=os.cpu_count())
-
-    # set up operators
+    ################################################################
+    ######################### STAGE INPUTS #########################
+    # Setup kinematic chain parameters
+    min_joints = 5
     max_joints = 7
-    num_generations = 150
-    num_population = 250
+    joint_type_bounds = (0, 2)  # 0: revolute, 1: prismatic, 2: fixed
+    joint_axis_bounds = (0, 2)  # 0: x-axis, 1: y-axis, 2: z-axis
+    link_length_bounds = (0.05, 0.75)  # min and max link length
+
+    # Setup problem parameters
+    num_generations = 5
+    num_population = 6
+    calibration_samples = 2
+    num_objectives = 6  # pose_error, torque, joint_count, conditioning_index, rrmc_score, rrt_path_cost
+    num_actors = os.cpu_count() // 2  # tune this to control memory vs. throughput
+    ray.init(num_cpus=num_actors)
+
+    # Set the robot starting position and translation
+    # CURRENT MESH X-BOUND: [-6.2, 7.7]
+    robot_to_amiga_translation = [0, 0, 1.025]
+    amiga_to_robot_translation = [0, -0.3, 0]
+    robot_system_translation = [-5.0, -2.5, 0.0]
+    
+    # Specify the window position and size for the loaded prune points (only uses prune points within this window)
+    window_x_position = robot_system_translation[0]
+    window_size = 2
+    ################################################################
+    ################################################################
+
+    # decision vector bounds
+    xl = [min_joints] + [joint_type_bounds[0], joint_axis_bounds[0], link_length_bounds[0]] * max_joints
+    xu = [max_joints] + [joint_type_bounds[1], joint_axis_bounds[1], link_length_bounds[1]] * max_joints
+    decision_vector_bounds = (xl, xu)
     var_types = ['int'] + ['int','int','real'] * max_joints
 
     # Find the urdf seeds
@@ -384,37 +415,33 @@ if __name__ == "__main__":
     urdf_dir = os.path.join(script_dir, 'urdf', 'robots', 'nsga2_seeds')
     seeds = load_seeds(urdf_dir, max_joints=max_joints)
 
-    # Set the robot starting position and translation
-    # CURRENT MESH X-BOUND: [-6.2, 7.7]
-    robot_to_amiga_translation = [0, 0, 1.025]
-    amiga_to_robot_translation = [0, -0.3, 0]
-    robot_system_translation = [-5.0, -2.5, 0.0]
-
+    # Load the robot system translation
     robot_translation = np.add(robot_to_amiga_translation, robot_system_translation)
     amiga_translation = np.add(amiga_to_robot_translation, robot_system_translation)
-    
-    # Load target prune points 
-    window_x_position = robot_system_translation[0]
-    window_size = 2
 
-    target_poses, target_offset_poses = orchard_ws.get_prune_poses_from_yaml(
+    # Load the prune poses from the YAML file
+    pose_data_results = orchard_ws.get_prune_poses_from_yaml(
         yaml_path='manipulator_codesign/prune_data/all_branches_info.yaml',
         robot_base=robot_translation,
         window_size=window_size,
         min_y=None,
         max_y=0.0,
         )
-    
-    print(len(target_poses))
+    target_poses, target_offset_poses = orchard_ws.package_poses(pose_data_results)
 
+    # Stage the problem
     problem = KinematicChainProblem(
         target_poses,
         target_offset_poses,
         robot_translation=robot_translation,
         mobile_base_translation=amiga_translation,
         seeds=seeds,
-        cal_samples=3,
-        num_actors=os.cpu_count() // 2       # tune this to control memory vs. throughput
+        dec_vec_bounds=decision_vector_bounds,
+        min_joints=min_joints,
+        max_joints=max_joints,
+        cal_samples=calibration_samples,
+        num_actors=num_actors,
+        num_objectives=num_objectives,
     )
 
     callback = None

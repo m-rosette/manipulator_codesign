@@ -129,6 +129,7 @@ class KinematicChainPyBullet(KinematicChainBase):
         self.mean_delta_joint_score_rrmc = None
         self.mean_pos_error_rrmc = None
         self.mean_ori_error_rrmc = None
+        self.max_rrt_path_cost = 0.0
 
         self.is_built = False
         self.is_loaded = False
@@ -155,6 +156,29 @@ class KinematicChainPyBullet(KinematicChainBase):
 
         # Initialize motion planner
         self.motion_planner = KinematicChainMotionPlanner(self.robot)
+
+    def sample_collision_free_poses(self, pose_candidates):
+        target_poses = []
+
+        for target_candidate in pose_candidates:
+            for j, target_pose in enumerate(target_candidate):
+                target_pose = tuple(target_pose)
+                joint_config = self.robot.inverse_kinematics(target_pose)
+                self.robot.reset_joint_positions(joint_config)
+                if not self.robot.collision_check(self.robot.robotId, self.collision_objects):
+                    target_poses.append(target_pose)
+                    break
+            else:
+                # If we never `break`, no collision-free orientation was found.
+                # Use the last pose's position but a default “front-facing (+y)” quaternion.
+                last_pose = target_candidate[-1]
+                pos = np.asarray(last_pose[0])
+                default_quat = R.from_euler('xyz', [90, 0, 180], degrees=True).as_quat()
+                fallback = (pos, default_quat)
+                target_poses.append(fallback)
+
+        return target_poses
+                
 
     def compute_chain_metrics(self, targets, targets_offset):
         # Compute the mean pose error and mean torque for the given targets.
@@ -202,12 +226,11 @@ class KinematicChainPyBullet(KinematicChainBase):
         joint_config = self.robot.inverse_kinematics(target_pose, pos_tol=0.01, rest_config=self.robot.home_config, max_iter=200, resample=True)
         
         # drive the robot to that config (for measurement)
-        self.robot.set_joint_configuration(joint_config)
+        self.robot.reset_joint_positions(joint_config)
         ee_pos, ee_ori = self.robot.get_link_state(self.robot.end_effector_index)
 
         # compute error
         if isinstance(target_pose, tuple) and len(target_pose) == 2:
-            # return self.compute_pose_error(target_pose, (ee_pos,ee_ori), weight_position=2.0, weight_orientation=0.25), joint_config
             target_pos, target_quat = target_pose
             _, _, pos_err_norm, _, ori_err_angle = self.robot.check_pose_within_tolerance(
             current_pos=ee_pos,
@@ -231,43 +254,16 @@ class KinematicChainPyBullet(KinematicChainBase):
 
         path = self.motion_planner.rrt_path(home, target_config, collision_objects, rrt_iter=500)
         if path is None:
-            return 1e3   # no collision-free path found
+            return 1.1 * self.max_rrt_path_cost  # Return a large penalty if no path is found
 
         # path cost = sum of successive L2 distances
         cost = 0.0
         for a, b in zip(path[:-1], path[1:]):
             cost += np.linalg.norm(np.array(a) - np.array(b))
+            
+        # Update the maximum path cost if this path is longer
+        self.max_rrt_path_cost = max(self.max_rrt_path_cost, cost)
         return cost
-    
-    def compute_motion_plan_fitness(self, pose_waypoints):
-        """
-        Compute the fitness of a motion plan by solving it in PyBullet.
-
-        This function plans a Cartesian motion path for the robot to follow the given
-        pose waypoints. It then computes the fitness of the motion plan based on the
-        error between the desired and actual end-effector poses.
-
-        Args:
-            pose_waypoints (list of tuple): A list of desired end-effector poses, where each
-                pose is represented as a tuple (position, orientation). Position is a tuple
-                of (x, y, z) coordinates, and orientation is a tuple of quaternion (x, y, z, w).
-
-        Returns:
-            float: The computed fitness value. A lower value indicates a better motion plan.
-                If the motion plan cannot be solved, a high fitness value of 1e6 is returned.
-        """
-        # Compute fitness by solving a motion plan in PyBullet.
-        joint_path = self.robot.plan_cartesian_motion_path(pose_waypoints, max_iterations=10000)
-        if joint_path is None:
-            return 1e6
-        else:
-            error = 0
-            for i, joint_config in enumerate(joint_path):
-                self.robot.reset_joint_positions(joint_config)
-                ee_pos, ee_ori = self.robot.get_link_state(self.robot.end_effector_index)
-                ee_pose = (ee_pos, ee_ori)
-                error += self.compute_pose_error(pose_waypoints[i], ee_pose)
-            return error
     
     def compute_global_conditioning_index(self, num_samples=100, epsilon=1e-6):
         """
@@ -292,7 +288,7 @@ class KinematicChainPyBullet(KinematicChainBase):
             ])
 
             # Set the robot to this configuration
-            self.robot.set_joint_configuration(list(random_config))
+            self.robot.reset_joint_positions(list(random_config))
 
             # Compute the Jacobian
             J = np.array(self.robot.get_jacobian(list(random_config)))
@@ -325,7 +321,7 @@ class KinematicChainPyBullet(KinematicChainBase):
             float: The magnitude of the gravity torque.
         """
         # Set the joint positions
-        self.robot.set_joint_configuration(joint_positions)
+        self.robot.reset_joint_positions(joint_positions)
 
         # Compute the gravity torque
         gravity_torque = self.robot.inverse_dynamics(joint_positions)
@@ -371,7 +367,7 @@ class KinematicChainPyBullet(KinematicChainBase):
         reachabilities, joint_configs = zip(*results)
 
         # Set the initial joint configuration (in front-back [+y] orientation)
-        self.robot.set_joint_configuration(joint_configs[0])
+        self.robot.reset_joint_positions(joint_configs[0])
 
         # Initialize variables to store the final results
         q_final = np.zeros((len(target_poses), self.num_joints))

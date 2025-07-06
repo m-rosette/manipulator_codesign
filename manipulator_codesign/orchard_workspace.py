@@ -127,7 +127,7 @@ def prune_pose(point, direction, base_point, robot_base,
 
     return p, quat, best['offset_pt']
 
-def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None, max_y=None):
+def get_prune_single_pose_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None, max_y=None):
     """
     Extracts prune poses from a YAML file and computes the best pose for each prune point.
 
@@ -164,6 +164,114 @@ def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None
     offset_poses = list(zip(offset_approach_points, prune_orientations))
 
     return poses, offset_poses
+
+def prune_pose_candidates(point, direction, base_point, robot_base,
+                          num_samples=36, radius=0.1):
+    """
+    Sample around the branch axis and return *all* candidate
+    (offset_pt, quaternion) on the side of the ring closest to robot_base.
+
+    Returns:
+      p                : original prune point, shape (3,)
+      offset_pts       : list of offset points (M,3)
+      quaternions      : list of corresponding [x,y,z,w] quaternions (M,4)
+    """
+    p = np.asarray(point, dtype=float)
+    v = np.asarray(direction, dtype=float)
+    r = np.asarray(robot_base, dtype=float)
+
+    # 1) Axis of branch
+    z0 = v / np.linalg.norm(v)
+
+    # 2) Build perp basis (u,w)
+    arb = np.array([1,0,0]) if abs(z0[0])<0.9 else np.array([0,1,0])
+    u = np.cross(z0, arb);  u /= np.linalg.norm(u)
+    w = np.cross(z0, u)
+
+    # Vector from prune point to robot
+    to_robot = (r - p) / np.linalg.norm(r - p)
+
+    offset_pts  = []
+    quaternions = []
+
+    # 3) Sample ring
+    for k in range(num_samples):
+        θ = 2*np.pi * k / num_samples
+        ring_dir = np.cos(θ)*u + np.sin(θ)*w
+        for sign in (+1, -1):
+            x_dir = sign * ring_dir
+            # only keep if pointing toward robot
+            if np.dot(x_dir, to_robot) <= 0:
+                continue
+
+            offset_pt = p + radius * x_dir
+
+            # build z-axis (back to robot), y-axis (RH rule)
+            z_axis = - (r - p)
+            z_axis /= np.linalg.norm(z_axis)
+            y_axis = np.cross(z_axis, x_dir)
+            y_axis /= np.linalg.norm(y_axis)
+
+            Rm = np.column_stack((x_dir, y_axis, z_axis))
+            quat = R.from_matrix(Rm).as_quat()  # [x,y,z,w]
+
+            offset_pts.append(offset_pt)
+            quaternions.append(quat)
+
+    if not offset_pts:
+        raise RuntimeError("No near‑side candidates found.")
+
+    return p, np.array(quaternions), np.array(offset_pts)
+
+def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None, max_y=None):
+    # Check to see if yaml path is valid
+    if not yaml_path or not isinstance(yaml_path, str):
+        raise ValueError("Invalid YAML path provided.")
+    
+    prune_points, base_dirs, base_pts = extract_prune_points(yaml_path)
+    filt_pts, filt_dirs, filt_bases = filter_prune_points(
+        prune_points, base_dirs, base_pts, robot_base[0],
+        window_size, min_y=min_y, max_y=max_y
+    )
+
+    all_results = []
+    for pt, dv, bp in zip(filt_pts, filt_dirs, filt_bases):
+        p, quats, offsets = prune_pose_candidates(pt, dv, bp, robot_base)
+        # Combine prune point and offset points with orientations
+        # prune_poses: (prune_point, orientation) for each orientation
+        prune_poses = [(p, quat) for quat in quats]
+        # offset_poses: (offset_point, orientation) for each offset/orientation
+        offset_poses = list(zip(offsets, quats))
+        all_results.append({
+            'prune_point': p,
+            'offset_points': offsets,        # shape (M,3)
+            'orientations': quats,           # shape (M,4)
+            'prune_poses': prune_poses,      # list of (prune_point, orientation)
+            'offset_poses': offset_poses     # list of (offset_point, orientation)
+        })
+
+    return all_results
+
+def package_poses(prune_data):
+    N = len(prune_data)
+    M = len(prune_data[0]['prune_poses'])   # number of candidates per prune
+
+    # create an empty (N, M, 2) array of Python objects
+    target_poses = np.empty((N, M, 2), dtype=object)
+    target_offset_poses = np.empty((N, M, 2), dtype=object)
+
+    for i, entry in enumerate(prune_data):
+        prune_list = entry['prune_poses']          # [(p, quat), (p, quat), ...]
+        for j, (p, quat) in enumerate(prune_list):
+            target_poses[i, j, 0] = p              # the 3‑vector
+            target_poses[i, j, 1] = quat           # the 4‑vector
+    
+    for i, entry in enumerate(prune_data):
+        prune_list = entry['offset_poses']          # [(p, quat), (p, quat), ...]
+        for j, (p, quat) in enumerate(prune_list):
+            target_offset_poses[i, j, 0] = p              # the 3‑vector
+            target_offset_poses[i, j, 1] = quat           # the 4‑vector
+    return target_poses, target_offset_poses
 
 def load_point_cloud(file_path):
     """
@@ -253,77 +361,64 @@ def downsample_point_cloud(pcd, voxel_size=0.01):
 
 def viz_prune_pose_candidates(prune_points, base_directions, base_points,
                               prune_fn, robot_base, idx=0,
-                              num_samples=36, radius=0.1, scale=1.0):
-    pt = prune_points[idx]
-    dv = base_directions[idx]
-    bp = base_points[idx]
-    r  = np.asarray(robot_base, float)
+                              num_samples=36, radius=0.1,
+                              orient_scale=0.05):
+    """
+    Visualize all robot‑facing candidate offsets and their x‑axes.
+    
+    Handles both full quaternions (4,) and rotation vectors (3,).
+    """
+    pt  = prune_points[idx]
+    dv  = base_directions[idx]
+    bp  = base_points[idx]
+    r   = np.asarray(robot_base, float)
 
-    # plot setup
+    # Get all candidate offsets & quats
+    p, quats, offsets = prune_fn(pt, dv, bp, r,
+                                  num_samples=num_samples,
+                                  radius=radius)
+    # --- setup ---
     fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_title(f"Prune #{idx}: candidates={num_samples}, radius={radius}")
+    ax  = fig.add_subplot(111, projection='3d')
+    ax.set_title(f"Prune #{idx}: {len(offsets)} candidates (radius={radius})")
 
-    # scatter points
+    # plot prune point & robot base
     ax.scatter(*pt, color='k', s=50, label='prune point')
     ax.scatter(*r,  color='g', s=50, label='robot base')
 
-    # branch direction quiver
+    # plot branch direction at p
     dv_n = dv / np.linalg.norm(dv)
-    ax.quiver(*pt, *(dv_n * scale),
+    ax.quiver(*pt, *(dv_n * orient_scale*2),
               color='r', linewidth=2,
-              arrow_length_ratio=0.1, label='branch direction')
+              arrow_length_ratio=0.2, label='branch dir')
 
-    # collect candidate endpoints
-    endpoints = []
-    z = dv_n
-    arb = np.array([1,0,0]) if abs(z[0])<0.9 else np.array([0,1,0])
-    u = np.cross(z, arb); u /= np.linalg.norm(u)
-    w = np.cross(z, u)
-    for k in range(num_samples):
-        θ = 2*np.pi * k / num_samples
-        x_c = np.cos(θ)*u + np.sin(θ)*w
-        endpoints.append(pt + radius * x_c)
-    endpoints = np.array(endpoints)
+    # plot all offset points
+    ax.scatter(offsets[:,0], offsets[:,1], offsets[:,2],
+               color='0.5', s=20, alpha=0.8, label='offset pts')
 
-    # highlight best
-    _, best_quat = prune_fn(pt, dv, bp, r, num_samples=num_samples, radius=radius)
-    R_best = R.from_quat(best_quat).as_matrix()
-    x_best = R_best[:,0]
-    best_endpt = pt + radius * x_best
+    # at each offset, draw its local x‑axis
+    for off, quat in zip(offsets, quats):
+        # detect quat vs rotvec
+        quat = np.asarray(quat)
+        if quat.size == 3:
+            Rm = R.from_rotvec(quat).as_matrix()
+        elif quat.size == 4:
+            Rm = R.from_quat(quat).as_matrix()
+        else:
+            raise ValueError(f"Invalid rotation data of size {quat.size}")
+        x_axis = Rm[:,0]
+        ax.quiver(off[0], off[1], off[2],
+              x_axis[0] * orient_scale,
+              x_axis[1] * orient_scale,
+              x_axis[2] * orient_scale,
+              color='b', linewidth=1, arrow_length_ratio=0.3)
 
-    # plot all candidates (gray)
-    for end in endpoints:
-        ax.plot([pt[0], end[0]*scale],
-                [pt[1], end[1]*scale],
-                [pt[2], end[2]*scale],
-                color='0.8', linewidth=1)
-    ax.scatter(endpoints[:,0]*scale, endpoints[:,1]*scale,
-               endpoints[:,2]*scale, color='0.8', s=10)
-
-    # best candidate (blue)
-    ax.plot([pt[0], best_endpt[0]*scale],
-            [pt[1], best_endpt[1]*scale],
-            [pt[2], best_endpt[2]*scale],
-            color='b', linewidth=2, label='best offset')
-    ax.scatter(best_endpt[0]*scale, best_endpt[1]*scale,
-               best_endpt[2]*scale, color='b', s=50)
-
-    # ---- set truly equal aspect ----
-    # gather all points we plotted
-    all_pts = np.vstack([
-        pt,
-        r,
-        endpoints * scale,
-        best_endpt * scale
-    ])
+    # equalize aspect
+    all_pts = np.vstack([pt, r, offsets])
     mins = all_pts.min(axis=0) - radius
     maxs = all_pts.max(axis=0) + radius
-    ranges = maxs - mins
-    max_range = ranges.max()
-    # center
+    max_range = (maxs - mins).max()
     centers = (maxs + mins) / 2
-
     ax.set_xlim(centers[0] - max_range/2, centers[0] + max_range/2)
     ax.set_ylim(centers[1] - max_range/2, centers[1] + max_range/2)
     ax.set_zlim(centers[2] - max_range/2, centers[2] + max_range/2)
@@ -385,7 +480,7 @@ if __name__ == "__main__":
 
     # o3d.visualization.draw_geometries([downsampled_pcd])
 
-    yaml_path = "/home/marcus/IMML/manipulator_codesign/results/all_branches_info.yaml"
+    yaml_path = "/home/marcus/IMML/manipulator_codesign/prune_data/all_branches_info.yaml"
     prune_points, base_directions, base_points = extract_prune_points(yaml_path)
 
     # define your robot base (replace or query dynamically)
@@ -395,10 +490,10 @@ if __name__ == "__main__":
         prune_points,
         base_directions,
         base_points,
-        prune_pose,        # your new selection fn
-        robot_base,
-        idx=10,
-        num_samples=60,
-        radius=1.0,
-        scale=1.0
+        prune_fn   = prune_pose_candidates,
+        robot_base = robot_base,
+        idx        = 0,        # which prune point to show
+        num_samples=36,        # same sampling you used in prune_pose_candidates
+        radius     = 1.0,      # same offset radius
+        orient_scale = 0.5    # size of the little x‐axis arrows
     )

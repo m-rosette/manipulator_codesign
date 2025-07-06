@@ -291,6 +291,9 @@ class URDFGen:
             origin = [0, 0, link_width + z_buffer, 0, 0, 0]
         
         else:
+            # Set the joint_limits based on the child length
+            joint_limit = [-child_length/2, child_length/2]
+
             origin = [0, 0, 0, 0, 0, 0]
             # 1) Create a fixed joint
             joint_name_fixed = f'{joint_name}_fixed'
@@ -406,8 +409,13 @@ class URDFGen:
                 if axis == '0 0 1':
                     z_buffer = 0.011
                     child_length = parent_length - link_width + z_buffer
+
                 self.add_prismatic_joint(joint_name, parent_name, child_name, axis, joint_limit, parent_length, child_length, link_width, color_code, color_name, collision, z_buffer)
                 
+                # child length for x or y translation is a default (short) length since the set child length is used for it's joint_limits
+                if axis == '1 0 0' or axis == '0 1 0':
+                    child_length = 2 * link_width 
+
             if joint_type == 'revolute':
                 # Create a small fixed 'cylinder' joint visualization for the revolute joint
                 self.create_joint_visual(parent_name, parent_length, axis, i, color_name, color_code)
@@ -596,9 +604,9 @@ if __name__ == '__main__':
     robot_name = 'test_robot'
     urdf_gen = URDFGen(robot_name)
 
-    joint_types = [2,0,2,0,2]
-    axes = [0,2,0,2,0]
-    link_lens = [0.75, 0.75, 0.5, 0.5, 0.4]
+    joint_types = [1, 0, 1, 1]
+    axes = [2, 0, 0, 1]
+    link_lens = [0.75, 0.25, 0.4, 0.4]
 
     joint_limit_prismatic = (-0.5, 0.5)
     joint_limit_revolute = (-3.14, 3.14)
