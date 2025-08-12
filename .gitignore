@@ -1,6 +1,7 @@
 data/
 figures/
 point_clouds/
+wandb/
 
 __pycache__*
 *.pyc

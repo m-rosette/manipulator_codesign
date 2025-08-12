@@ -184,15 +184,22 @@ class KinematicChainPyBullet(KinematicChainBase):
         # Compute the mean pose error and mean torque for the given targets.
         pose_errors, self.target_joint_positions = zip(*[self.compute_pose_fitness(target) for target in targets_offset])
         self.mean_pose_error = np.mean(pose_errors)
+        self.std_pose_error = np.std(pose_errors)
 
         # Compute the rrt path cost for the target joint positions with the tree collision mesh.
         rrt_path_costs = [self.compute_rrt_path_cost(joint_positions, collision_objects=self.collision_objects) for joint_positions in self.target_joint_positions]
         self.mean_rrt_path_cost = np.mean(rrt_path_costs)
+        self.std_rrt_path_cost = np.std(rrt_path_costs)
 
         # Remove the last collision object (assumed to be the tree mesh). This is necessary to get global metrics of torque, GCI, and manipulability.
         self.pyb_con.removeBody(self.collision_objects[-1])  
 
-        self.mean_torque = np.mean([self.compute_gravity_torque_magnitute(joint_positions) for joint_positions in self.target_joint_positions])
+        torques = [
+            self.compute_gravity_torque_magnitute(joint_positions)
+            for joint_positions in self.target_joint_positions
+        ]
+        self.mean_torque = np.mean(torques)
+        self.std_torque = np.std(torques)
 
         # Compute the Global Conditioning Index (GCI) for the kinematic chain.
         self.global_conditioning_index = self.compute_global_conditioning_index(num_samples=50)
@@ -200,9 +207,17 @@ class KinematicChainPyBullet(KinematicChainBase):
         # Compute the manipulability score and delta joint score using resolved-rate motion control.
         final_configs, manip_scores, delta_joint_scores, pose_errors_rrmc = zip(*[self.compute_resolved_rate_motion_control_fitness(target) for target in targets])
         self.mean_manip_score_rrmc = np.mean(manip_scores)
+        self.std_manip_score_rrmc = np.std(manip_scores)
+
         self.mean_delta_joint_score_rrmc = np.mean(delta_joint_scores)
+        self.std_delta_joint_score_rrmc = np.std(delta_joint_scores)
+
+        # pose_errors_rrmc is a tuple of two sequences: (pos_errors, ori_errors)
         self.mean_pos_error_rrmc = np.mean(pose_errors_rrmc[0])
+        self.std_pos_error_rrmc = np.std(pose_errors_rrmc[0])
+        
         self.mean_ori_error_rrmc = np.mean(pose_errors_rrmc[1])
+        self.std_ori_error_rrmc = np.std(pose_errors_rrmc[1])
 
     def compute_pose_fitness(self, target_pose):
         """
@@ -223,7 +238,7 @@ class KinematicChainPyBullet(KinematicChainBase):
                IK computation, a large fitness value (1e6) is returned.
         """
         # Step 4: Compute IK
-        joint_config = self.robot.inverse_kinematics(target_pose, pos_tol=0.01, rest_config=self.robot.home_config, max_iter=200, resample=True)
+        joint_config = self.robot.inverse_kinematics(target_pose, pos_tol=0.01, rest_config=self.robot.home_config, max_iter=200)
         
         # drive the robot to that config (for measurement)
         self.robot.reset_joint_positions(joint_config)

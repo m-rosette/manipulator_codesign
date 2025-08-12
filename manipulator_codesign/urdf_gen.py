@@ -357,10 +357,12 @@ class URDFGen:
             None
         """
         # Create a probe end effector
-        self.robot.append(self.create_joint('probe_joint', parent, 'probe_link', [0, 0, last_link_length, 0, 0, 0], 'fixed'))
-        self.robot.append(self.create_link('probe_link', link_len=0.1, link_width=0.01, mass=0, collision=False))
+        probe_length = 0.1
 
-        self.robot.append(self.create_joint('end_effector_joint', 'probe_link', 'end_effector', [0, 0, 0.1, 0, 0, 0], 'fixed'))
+        self.robot.append(self.create_joint('probe_joint', parent, 'probe_link', [0, 0, last_link_length, 0, 0, 0], 'fixed'))
+        self.robot.append(self.create_link('probe_link', link_len=probe_length, link_width=0.01, mass=0, collision=False))
+
+        self.robot.append(self.create_joint('end_effector_joint', 'probe_link', 'end_effector', [0, 0, probe_length/2, 0, 0, 0], 'fixed'))
         self.robot.append(self.create_link('end_effector', link_len=0, link_width=0, mass=0, collision=False))
     
     def create_manipulator(self, axes, joint_types, link_lens, joint_lims, link_width=0.05, link_shape='cylinder', collision=False, gripper=False):
