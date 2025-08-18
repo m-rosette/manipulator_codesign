@@ -136,6 +136,16 @@ class KinematicChainPyBullet(KinematicChainBase):
 
         self.default_joint_config = [0.0] * self.num_joints
 
+        self.pose_errors_compiled = []
+        self.target_joint_positions_compiled = []
+        self.rrt_path_costs_compiled = []
+        self.torques_compiled = []
+        self.manip_scores_compiled = []
+        self.delta_joint_scores_compiled = []
+        self.pos_errors_rrmc_compiled = []
+        self.ori_errors_rrmc_compiled = []
+        self.global_conditioning_index_compiled = []
+
     def build_robot(self):
         # Create a URDF for this chain.
         self.create_urdf()
@@ -179,45 +189,73 @@ class KinematicChainPyBullet(KinematicChainBase):
 
         return target_poses
                 
-
     def compute_chain_metrics(self, targets, targets_offset):
         # Compute the mean pose error and mean torque for the given targets.
         pose_errors, self.target_joint_positions = zip(*[self.compute_pose_fitness(target) for target in targets_offset])
-        self.mean_pose_error = np.mean(pose_errors)
-        self.std_pose_error = np.std(pose_errors)
+        self.pose_errors_compiled.extend(pose_errors)
 
         # Compute the rrt path cost for the target joint positions with the tree collision mesh.
         rrt_path_costs = [self.compute_rrt_path_cost(joint_positions, collision_objects=self.collision_objects) for joint_positions in self.target_joint_positions]
-        self.mean_rrt_path_cost = np.mean(rrt_path_costs)
-        self.std_rrt_path_cost = np.std(rrt_path_costs)
+        self.rrt_path_costs_compiled.extend(rrt_path_costs)
 
-        # Remove the last collision object (assumed to be the tree mesh). This is necessary to get global metrics of torque, GCI, and manipulability.
-        self.pyb_con.removeBody(self.collision_objects[-1])  
+        # move the tree out of the way by sending it high on z 
+        try:
+            self.pyb_con.resetBasePositionAndOrientation(
+                self.collision_objects[-1],
+                [0, 0, 10],
+                self.pyb_con.getQuaternionFromEuler([0, 0, 0])
+            )
+        except Exception:
+            # if collision_objects[-1] is not a body id or missing, ignore
+            print("Warning: Could not move the tree collision object. It may not be loaded or is not a valid body ID.")
+            pass
 
-        torques = [
-            self.compute_gravity_torque_magnitute(joint_positions)
-            for joint_positions in self.target_joint_positions
-        ]
-        self.mean_torque = np.mean(torques)
-        self.std_torque = np.std(torques)
-
-        # Compute the Global Conditioning Index (GCI) for the kinematic chain.
-        self.global_conditioning_index = self.compute_global_conditioning_index(num_samples=50)
+        # Compute the gravity torque magnitude for the target joint positions
+        torques = [self.compute_gravity_torque_magnitute(joint_positions) for joint_positions in self.target_joint_positions]
+        self.torques_compiled.extend(torques)
 
         # Compute the manipulability score and delta joint score using resolved-rate motion control.
         final_configs, manip_scores, delta_joint_scores, pose_errors_rrmc = zip(*[self.compute_resolved_rate_motion_control_fitness(target) for target in targets])
-        self.mean_manip_score_rrmc = np.mean(manip_scores)
-        self.std_manip_score_rrmc = np.std(manip_scores)
+        # manip_scores, delta_joint_scores are list-like per target; flatten them
+        # if manip_scores is array-like per target, convert/extend
+        flat_manip = np.concatenate([np.asarray(m) for m in manip_scores])
+        flat_delta = np.concatenate([np.asarray(d) for d in delta_joint_scores])
+        flat_pos_err = np.concatenate([np.asarray(pe[0]) for pe in pose_errors_rrmc])
+        flat_ori_err = np.concatenate([np.asarray(pe[1]) for pe in pose_errors_rrmc])
 
-        self.mean_delta_joint_score_rrmc = np.mean(delta_joint_scores)
-        self.std_delta_joint_score_rrmc = np.std(delta_joint_scores)
+        self.manip_scores_compiled.extend(flat_manip.tolist())
+        self.delta_joint_scores_compiled.extend(flat_delta.tolist())
+        self.pos_errors_rrmc_compiled.extend(flat_pos_err.tolist())
+        self.ori_errors_rrmc_compiled.extend(flat_ori_err.tolist())
 
-        # pose_errors_rrmc is a tuple of two sequences: (pos_errors, ori_errors)
-        self.mean_pos_error_rrmc = np.mean(pose_errors_rrmc[0])
-        self.std_pos_error_rrmc = np.std(pose_errors_rrmc[0])
+        # Compute the Global Conditioning Index (GCI) for the kinematic chain.
+        global_conditioning_index = self.compute_global_conditioning_index(num_samples=50)
+        self.global_conditioning_index_compiled.append(global_conditioning_index)
+
+    def compute_chain_metric_stats(self):
+        self.mean_pose_error = np.mean(self.pose_errors_compiled)
+        self.std_pose_error = np.std(self.pose_errors_compiled)
+
+        self.mean_rrt_path_cost = np.mean(self.rrt_path_costs_compiled)
+        self.std_rrt_path_cost = np.std(self.rrt_path_costs_compiled)
+
+        self.mean_torque = np.mean(self.torques_compiled)
+        self.std_torque = np.std(self.torques_compiled)
+
+        self.mean_manip_score_rrmc = np.mean(self.manip_scores_compiled)
+        self.std_manip_score_rrmc = np.std(self.manip_scores_compiled)
+
+        self.mean_delta_joint_score_rrmc = np.mean(self.delta_joint_scores_compiled)
+        self.std_delta_joint_score_rrmc = np.std(self.delta_joint_scores_compiled)
+
+        self.mean_pos_error_rrmc = np.mean(self.pos_errors_rrmc_compiled)
+        self.std_pos_error_rrmc = np.std(self.pos_errors_rrmc_compiled)
         
-        self.mean_ori_error_rrmc = np.mean(pose_errors_rrmc[1])
-        self.std_ori_error_rrmc = np.std(pose_errors_rrmc[1])
+        self.mean_ori_error_rrmc = np.mean(self.ori_errors_rrmc_compiled)
+        self.std_ori_error_rrmc = np.std(self.ori_errors_rrmc_compiled)
+
+        self.global_conditioning_index = np.mean(self.global_conditioning_index_compiled)
+        self.std_global_conditioning_index = np.std(self.global_conditioning_index_compiled)
 
     def compute_pose_fitness(self, target_pose):
         """
