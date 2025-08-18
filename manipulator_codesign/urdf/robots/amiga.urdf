@@ -6,7 +6,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="/home/marcus/IMML/manipulator_codesign/external/pybullet_robokit/pybullet_robokit/meshes/frame_on_amiga_v2_simplified.stl"/>
+        <mesh filename="/manipulator_codesign/manipulator_codesign/meshes/frame_on_amiga_v2_simplified.stl"/>
       </geometry>
       <material name="LightLightGrey">
         <color rgba="0.941 0.941 0.941 1.0"/>

@@ -2,132 +2,24 @@ import os
 import pickle
 from datetime import datetime
 import argparse
-
 import numpy as np
-import pandas as pd
 import ray
 import wandb
+
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
-from pymoo.core.sampling import Sampling
-from pymoo.core.crossover import Crossover
-from pymoo.core.mutation import Mutation
 from pymoo.operators.sampling.lhs import LatinHypercubeSampling
 from pymoo.operators.crossover.sbx import SimulatedBinaryCrossover
-from pymoo.operators.crossover.ux import UniformCrossover
 from pymoo.operators.mutation.pm import PolynomialMutation
 from pymoo.optimize import minimize
 from pymoo.core.callback import Callback 
 
+from manipulator_codesign.nsga2_operators import SeededSampling, MixedSampling, MixedCrossover, MixedMutation
 from manipulator_codesign.moo_decoder import decode_decision_vector
-from manipulator_codesign.urdf_to_decision_vector import encode_seed, urdf_to_decision_vector, load_seeds
+from manipulator_codesign.urdf_to_decision_vector import load_seeds
 from manipulator_codesign.kinematic_chain import KinematicChainPyBullet
 import manipulator_codesign.orchard_workspace as orchard_ws
 from pybullet_robokit.load_objects import LoadObjects
-
-
-# -------- Seeded & Mixed Operators --------
-class SeededSampling(Sampling):
-    def __init__(self, var_types, seeds, fallback_sampler):
-        super().__init__()
-        self.var_types = var_types
-        self.seeds = [np.asarray(x, dtype=float) for x in seeds]
-        self.fallback = fallback_sampler
-        n_var = len(var_types)
-        for x in self.seeds:
-            assert x.shape == (n_var,)
-    def _do(self, problem, n_samples, **kwargs):
-        print("[SeededSampling] Generating initial population with seeds...")
-        n_seeds = min(len(self.seeds), n_samples)
-        X_seeded = np.stack(self.seeds[:n_seeds], axis=0)
-        n_rem = n_samples - n_seeds
-        if n_rem > 0:
-            X_rest = self.fallback._do(problem, n_rem, **kwargs)
-            return np.vstack([X_seeded, X_rest])
-        return X_seeded
-
-
-class MixedSampling(Sampling):
-    def __init__(self, var_types):
-        super().__init__()
-        self.var_types = var_types
-        self.lhs = LatinHypercubeSampling()
-
-    def _do(self, problem, n_samples, **kwargs):
-        # 1) first generate the “real” vars
-        X = self.lhs._do(problem, n_samples, **kwargs)
-
-        # 2) now overwrite all integer slots with true randint [xl, xu] inclusive
-        for i, t in enumerate(self.var_types):
-            if t != 'real':
-                lo, hi = int(problem.xl[i]), int(problem.xu[i])
-                # +1 on hi to make it inclusive
-                X[:, i] = np.random.randint(lo, hi + 1, size=n_samples)
-
-        return X
-
-
-class MixedCrossover(Crossover):
-    def __init__(self, var_types, eta_sbx=10, prob_real=0.9, prob_int=0.5):
-        super().__init__(2, 2)
-        self.var_types = var_types
-        self.sbx = SimulatedBinaryCrossover(prob=prob_real, eta=eta_sbx)
-        self.uni = UniformCrossover(prob=prob_int)
-    def _do(self, problem, X, **kwargs):
-        real_idx = [i for i, t in enumerate(self.var_types) if t == 'real']
-        int_idx = [i for i, t in enumerate(self.var_types) if t != 'real']
-        Y = np.empty_like(X)
-        if real_idx:
-            sub_prob = Problem(n_var=len(real_idx), n_obj=problem.n_obj,
-                               xl=problem.xl[real_idx], xu=problem.xu[real_idx])
-            Yr = self.sbx._do(sub_prob, X[:, :, real_idx], **kwargs)
-            for idx, col in enumerate(real_idx):
-                Y[:, :, col] = Yr[:, :, idx]
-        if int_idx:
-            Yi = self.uni._do(problem, X[:, :, int_idx], **kwargs)
-            for idx, col in enumerate(int_idx):
-                Y[:, :, col] = Yi[:, :, idx].round().astype(int)
-        return Y
-
-
-class MixedMutation(Mutation):
-    def __init__(self, var_types, eta_pm=20, prob_real=None, prob_int=0.1):
-        super().__init__(1, 1)
-        self.var_types = var_types
-        self.eta_pm = eta_pm
-        self.prob_real = prob_real
-        self.prob_int = prob_int
-    def _do(self, problem, X, **kwargs):
-        real_idx = [i for i, t in enumerate(self.var_types) if t == 'real']
-        int_idx = [i for i, t in enumerate(self.var_types) if t != 'real']
-        Y = X.copy()
-        if X.ndim == 2:
-            if real_idx:
-                sub_prob = Problem(n_var=len(real_idx), n_obj=problem.n_obj,
-                                   xl=problem.xl[real_idx], xu=problem.xu[real_idx])
-                Yr = PolynomialMutation(eta=self.eta_pm, prob=self.prob_real)._do(
-                    sub_prob, X[:, real_idx], **kwargs)
-                Y[:, real_idx] = Yr
-            for col in int_idx:
-                mask = np.random.rand(Y.shape[0]) < self.prob_int
-                if mask.any():
-                    lo, hi = int(problem.xl[col]), int(problem.xu[col])
-                    Y[mask, col] = np.random.randint(lo, hi + 1, mask.sum())
-        else:
-            # 3D fallback
-            n = X.shape[0]
-            if real_idx:
-                sub_prob = Problem(n_var=len(real_idx), n_obj=problem.n_obj,
-                                   xl=problem.xl[real_idx], xu=problem.xu[real_idx])
-                Yr = PolynomialMutation(eta=self.eta_pm, prob=self.prob_real)._do(
-                    sub_prob, X[:, 0, real_idx], **kwargs)
-                Y[:, 0, real_idx] = Yr
-            for col in int_idx:
-                mask = np.random.rand(n) < self.prob_int
-                if mask.any():
-                    lo, hi = int(problem.xl[col]), int(problem.xu[col])
-                    Y[mask, 0, col] = np.random.randint(lo, hi + 1, mask.sum())
-        return Y
 
 
 # -------- Ray Actor for Persistent Evaluation --------
@@ -136,7 +28,6 @@ class Evaluator:
     def __init__(self,
                  mesh_path: str,
                  robot_urdf: str,
-                 mobile_base_translation,
                  flags: int):
         import pybullet as p, pybullet_data
         self.p = p
@@ -144,55 +35,83 @@ class Evaluator:
         self.p.setAdditionalSearchPath(pybullet_data.getDataPath())
         self.p.setGravity(0, 0, -9.81)
 
+        self.robot_urdf = robot_urdf
+        self.flags = flags
+
         # single‐time mesh load
         self.tree_collision_shape = self.p.createCollisionShape(
             shapeType=self.p.GEOM_MESH,
             fileName=mesh_path,
             flags=self.p.GEOM_FORCE_CONCAVE_TRIMESH
         )
-        self.robot_urdf = robot_urdf
-        self.mobile_base_translation = mobile_base_translation
-        self.flags = flags
 
-    def evaluate(self, x, targets, targets_offset,
-                 robot_translation, min_j, max_j,
+    def evaluate(self, x, 
+                 targets_list, targets_offset_list,
+                 robot_translations_list, mobile_base_translations_list,
+                 min_j, max_j,
                  alpha, beta, delta, gamma):
         p = self.p    
         p.setGravity(0, 0, -9.81)   
+        self.object_loader = LoadObjects(p)
 
-        # load robot
-        object_loader = LoadObjects(p)
-        amiga_id = object_loader.load_urdf(
+        n_positions = len(robot_translations_list)
+        assert n_positions == len(mobile_base_translations_list) == len(targets_list) == len(targets_offset_list), \
+            "All lists of per-base inputs must have the same length"
+        
+        # load robot at a default position
+        # (this will be overridden in the loop below)
+        self.amiga_id = self.object_loader.load_urdf(
             self.robot_urdf,
-            start_pos=self.mobile_base_translation,
+            start_pos=[0, 0, 0],
             start_orientation=[0,0,0],
             fix_base=True,
             flags=self.flags
         )
 
-        # load tree once per evaluation
-        tree_id = p.createMultiBody(
+        # load tree
+        self.tree_id = p.createMultiBody(
             baseCollisionShapeIndex=self.tree_collision_shape,
             baseVisualShapeIndex=-1,
             basePosition=[0,0,0]
         )
-        object_loader.collision_objects.extend([amiga_id, tree_id])
+        self.object_loader.collision_objects.extend([self.amiga_id, self.tree_id])
 
-        # decode and build kinematic chain
+        # decode kinematic chain
         n, types, axes, lengths = decode_decision_vector(x, min_j, max_j)
+
         ch = KinematicChainPyBullet(
-            p, robot_translation,
+            p, [0, 0, 0],
             n, types, axes, lengths,
-            collision_objects=object_loader.collision_objects
+            collision_objects=self.object_loader.collision_objects
         )
+
         if not ch.is_built:
             ch.build_robot()
         ch.load_robot()
 
-        targets = ch.sample_collision_free_poses(targets)
-        targets_offset = ch.sample_collision_free_poses(targets_offset)
+        for i in range(n_positions):
+            self.p.resetBasePositionAndOrientation(
+                self.amiga_id,
+                mobile_base_translations_list[i],
+                self.p.getQuaternionFromEuler([0, 0, 0])
+            )
+            self.p.resetBasePositionAndOrientation(
+                ch.robot.robotId,
+                robot_translations_list[i],
+                self.p.getQuaternionFromEuler([0, 0, 0])
+            )
+            self.p.resetBasePositionAndOrientation(
+                self.tree_id,
+                [0, 0, 0],
+                self.p.getQuaternionFromEuler([0, 0, 0])
+            )
+            
+            targets = ch.sample_collision_free_poses(targets_list[i])
+            targets_offset = ch.sample_collision_free_poses(targets_offset_list[i])
 
-        ch.compute_chain_metrics(targets, targets_offset)
+            ch.compute_chain_metrics(targets, targets_offset)
+
+        ch.compute_chain_metric_stats()
 
         # cleanup
         p.resetSimulation()
@@ -238,7 +157,6 @@ class KinematicChainProblem(Problem):
             Evaluator.options(max_concurrency=1).remote(
                 mesh_path,
                 robot_urdf,
-                self.mobile_base_translation,
                 flags
             )
             for _ in range(num_actors)
@@ -269,13 +187,20 @@ class KinematicChainProblem(Problem):
 
     def _parallel_calibration(self):
         print("[Calibration] Running parallel calibration samples...")
+        # Calibrate the problem with the first location and targets in the lists
+        location_idx = 0
+        robot_translation = [self.robot_translation[location_idx]]
+        mobile_base_translation = [self.mobile_base_translation[location_idx]]
+        targets = [self.targets[location_idx]]
+        targets_offset = [self.targets_offset[location_idx]]
+        
         # round-robin assignment
         futures = []
         for i, x in enumerate(self._x_cal):
             actor = self.actors[i % len(self.actors)]
             futures.append(actor.evaluate.remote(
-                x, self.targets, self.targets_offset,
-                self.robot_translation,
+                x, targets, targets_offset,
+                robot_translation, mobile_base_translation,
                 self.min_joints, self.max_joints,
                 self.alpha, self.beta, self.delta, self.gamma
             ))
@@ -298,7 +223,7 @@ class KinematicChainProblem(Problem):
             actor = self.actors[i % len(self.actors)]
             futures.append(actor.evaluate.remote(
                 X[i], self.targets, self.targets_offset,
-                self.robot_translation,
+                self.robot_translation, self.mobile_base_translation,
                 self.min_joints, self.max_joints,
                 self.alpha, self.beta, self.delta, self.gamma
             ))
@@ -358,36 +283,33 @@ class WandbLogger(Callback):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run NSGA2 with optional W&B and mixed-mode logging")
-    parser.add_argument(
-        "--wandb", action="store_true", default=False,
-        help="Enable Weights & Biases logging"
-    )
-    parser.add_argument(
-        "--mixed", dest="mixed", action="store_true",
-        help="Use mixed custom operators"
-    )
-    parser.add_argument(
-        "--no-mixed", dest="mixed", action="store_false",
-        help="Use standard Pymoo operators"
-    )
+    parser.add_argument('--max_joints',  type=int, default=7, help='Maximum joints in chain')
+    parser.add_argument('--min_joints',  type=int, default=5, help='Minimum joints in chain')
+    parser.add_argument('--population',   type=int, default=16, help='Population size')
+    parser.add_argument('--generations', type=int, default=10, help='Number of generations')
+    parser.add_argument('--calibration_samples', type=int, default=6, help='Number of calibration samples')
+    parser.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging")
+    parser.add_argument("--mixed", dest="mixed", action="store_true", help="Use mixed custom operators")
+    parser.add_argument("--no-mixed", dest="mixed", action="store_false", help="Use standard Pymoo operators")
     parser.set_defaults(mixed=True)
     args = parser.parse_args()
-    use_wandb = args.wandb
-    use_mixed = args.mixed
 
     ################################################################
     ######################### STAGE INPUTS #########################
+    use_wandb = args.wandb
+    use_mixed = args.mixed
+    
     # Setup kinematic chain parameters
-    min_joints = 5
-    max_joints = 7
+    min_joints = args.min_joints
+    max_joints = args.max_joints
     joint_type_bounds = (0, 2)  # 0: revolute, 1: prismatic, 2: fixed
     joint_axis_bounds = (0, 2)  # 0: x-axis, 1: y-axis, 2: z-axis
     link_length_bounds = (0.05, 0.75)  # min and max link length
 
     # Setup problem parameters
-    num_generations = 5
-    num_population = 6
-    calibration_samples = 2
+    num_generations = args.generations
+    num_population = args.population
+    calibration_samples = args.calibration_samples
     num_objectives = 6  # pose_error, torque, joint_count, conditioning_index, rrmc_score, rrt_path_cost
     num_actors = os.cpu_count() // 2  # tune this to control memory vs. throughput
     ray.init(num_cpus=num_actors)
@@ -396,11 +318,11 @@ if __name__ == "__main__":
     # CURRENT MESH X-BOUND: [-6.2, 7.7]
     robot_to_amiga_translation = [0, 0, 1.025]
     amiga_to_robot_translation = [0, -0.3, 0]
-    robot_system_translation = [-5.0, -2.5, 0.0]
+    robot_system_locations = [[-4.0, -2.25, 0.0], [-1.5, -2.25, 0.0], [1.0, -2.25, 0.0], [3.5, -2.25, 0.0], [6.0, -2.25, 0.0]]
     
     # Specify the window position and size for the loaded prune points (only uses prune points within this window)
-    window_x_position = robot_system_translation[0]
-    window_size = 2
+    window_x_positions = [loc[0] for loc in robot_system_locations]
+    window_size = 2.5
     ################################################################
     ################################################################
 
@@ -416,25 +338,35 @@ if __name__ == "__main__":
     seeds = load_seeds(urdf_dir, max_joints=max_joints)
 
     # Load the robot system translation
-    robot_translation = np.add(robot_to_amiga_translation, robot_system_translation)
-    amiga_translation = np.add(amiga_to_robot_translation, robot_system_translation)
+    robot_translations = []
+    amiga_translations = []
+    target_poses_list = []
+    target_offset_poses_list = []
+    for robot_system_translation in robot_system_locations:
+        # Calculate the robot and amiga translations based on the system translation
+        # This assumes the robot is always at the origin of the mobile base
+        # and the amiga is offset by a fixed translation.
+        robot_translations.append(np.add(robot_to_amiga_translation, robot_system_translation))
+        amiga_translations.append(np.add(amiga_to_robot_translation, robot_system_translation))
 
-    # Load the prune poses from the YAML file
-    pose_data_results = orchard_ws.get_prune_poses_from_yaml(
-        yaml_path='manipulator_codesign/prune_data/all_branches_info.yaml',
-        robot_base=robot_translation,
-        window_size=window_size,
-        min_y=None,
-        max_y=0.0,
-        )
-    target_poses, target_offset_poses = orchard_ws.package_poses(pose_data_results)
+        # Load the prune poses from the YAML file
+        pose_data_results = orchard_ws.get_prune_poses_from_yaml(
+            yaml_path='manipulator_codesign/prune_data/all_branches_info.yaml',
+            robot_base=robot_translations[-1],
+            window_size=window_size,
+            min_y=None,
+            max_y=0.0,
+            )
+        target_poses, target_offset_poses = orchard_ws.package_poses(pose_data_results)
+        target_poses_list.append(target_poses)
+        target_offset_poses_list.append(target_offset_poses)
 
     # Stage the problem
     problem = KinematicChainProblem(
-        target_poses,
-        target_offset_poses,
-        robot_translation=robot_translation,
-        mobile_base_translation=amiga_translation,
+        target_poses_list,
+        target_offset_poses_list,
+        robot_translation=robot_translations,
+        mobile_base_translation=amiga_translations,
         seeds=seeds,
         dec_vec_bounds=decision_vector_bounds,
         min_joints=min_joints,
