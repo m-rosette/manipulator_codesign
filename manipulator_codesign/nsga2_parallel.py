@@ -12,7 +12,6 @@ from pymoo.operators.sampling.lhs import LatinHypercubeSampling
 from pymoo.operators.crossover.sbx import SimulatedBinaryCrossover
 from pymoo.operators.mutation.pm import PolynomialMutation
 from pymoo.optimize import minimize
-from pymoo.core.callback import Callback 
 
 from manipulator_codesign.nsga2_operators import SeededSampling, MixedSampling, MixedCrossover, MixedMutation
 from manipulator_codesign.moo_decoder import decode_decision_vector
@@ -20,6 +19,7 @@ from manipulator_codesign.urdf_to_decision_vector import load_seeds
 from manipulator_codesign.kinematic_chain import KinematicChainPyBullet
 import manipulator_codesign.orchard_workspace as orchard_ws
 from pybullet_robokit.load_objects import LoadObjects
+from nsga2_callbacks import CombinedCallback, WandbLogger, CheckpointCallback
 
 
 # -------- Ray Actor for Persistent Evaluation --------
@@ -259,28 +259,6 @@ class KinematicChainProblem(Problem):
         out["F"] = F
 
 
-# -------- W&B Callback --------
-class WandbLogger(Callback):
-    def __init__(self):
-        super().__init__()
-        self.gen = 0
-    def notify(self, algorithm):
-        F = algorithm.pop.get("F")
-        mean_obj = F.mean(axis=0)
-        
-        # objective names
-        obj_names = ['pose_error', 'torque', 'joint_count',
-                     'conditioning_index', 'rrmc_score',
-                     'rrt_path_cost']
-
-        # log per-generation aggregates
-        log_dict = {"generation": self.gen}
-        log_dict.update({f'{obj_names[i]}_mean': mean_obj[i] for i in range(F.shape[1])})
-        wandb.log(log_dict, step=self.gen)
-
-        self.gen += 1
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run NSGA2 with optional W&B and mixed-mode logging")
     parser.add_argument('--max_joints',  type=int, default=7, help='Maximum joints in chain')
@@ -311,7 +289,7 @@ if __name__ == "__main__":
     num_population = args.population
     calibration_samples = args.calibration_samples
     num_objectives = 6  # pose_error, torque, joint_count, conditioning_index, rrmc_score, rrt_path_cost
-    num_actors = os.cpu_count() // 2  # tune this to control memory vs. throughput
+    num_actors = os.cpu_count()  # tune this to control memory vs. throughput
     ray.init(num_cpus=num_actors)
 
     # Set the robot starting position and translation
@@ -323,6 +301,10 @@ if __name__ == "__main__":
     # Specify the window position and size for the loaded prune points (only uses prune points within this window)
     window_x_positions = [loc[0] for loc in robot_system_locations]
     window_size = 2.5
+
+    # Data directory for saving results
+    data_dir = 'data/nsga2_results'
+    os.makedirs(data_dir, exist_ok=True)
     ################################################################
     ################################################################
 
@@ -376,7 +358,9 @@ if __name__ == "__main__":
         num_objectives=num_objectives,
     )
 
-    callback = None
+    # setup callbacks
+    callback = CheckpointCallback(out_dir=data_dir, every=1, keep_last=5)
+
     if use_wandb:
         api_key = os.environ.get("WANDB_API_KEY")
         if api_key is None:
@@ -400,7 +384,7 @@ if __name__ == "__main__":
                 "mutation": "MixedMutation"
             }
         )
-        callback = WandbLogger()
+        callback = CombinedCallback(callback, WandbLogger())
 
     # algorithm selection
     if use_mixed:
@@ -439,8 +423,6 @@ if __name__ == "__main__":
     res = minimize(**minimize_kwargs)
 
     # save results locally
-    data_dir = 'data/nsga2_results'
-    os.makedirs(data_dir, exist_ok=True)
     fn = os.path.join(data_dir, f"results_{datetime.now():%Y%m%d_%H%M%S}.pkl")
     with open(fn, 'wb') as f:
         pickle.dump({'X': res.X, 'F': res.F}, f)
