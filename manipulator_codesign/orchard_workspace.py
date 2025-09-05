@@ -236,7 +236,7 @@ def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None
 
     all_results = []
     for pt, dv, bp in zip(filt_pts, filt_dirs, filt_bases):
-        p, quats, offsets = prune_pose_candidates(pt, dv, bp, robot_base)
+        p, quats, offsets = prune_pose_candidates(pt, dv, bp, robot_base, num_samples=8)
         # Combine prune point and offset points with orientations
         # prune_poses: (prune_point, orientation) for each orientation
         prune_poses = [(p, quat) for quat in quats]

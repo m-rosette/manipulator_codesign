@@ -1,7 +1,23 @@
+#!/usr/bin/env python3
+"""
+nsga2_ray_batched.py
+
+This is your original NSGA2 entry script updated to:
+ - create Ray Evaluator actors that expose evaluate_batch(...)
+ - send chunks of decision vectors to each actor to amortize RPC / setup overhead
+
+Behavior is intentionally conservative: each actor uses a single pybullet DIRECT client
+and reuses the same Python helpers you already have (KinematicChainPyBullet, LoadObjects, etc).
+If you want true multi-client-per-process packing (multiple pybullet clients inside one actor),
+you can extend the Evaluator to create multiple clients and forward physicsClientId to your helper classes.
+"""
+
 import os
 import pickle
 from datetime import datetime
 import argparse
+import math
+import time
 import numpy as np
 import ray
 import wandb
@@ -22,98 +38,121 @@ from pybullet_robokit.load_objects import LoadObjects
 from nsga2_callbacks import CombinedCallback, WandbLogger, CheckpointCallback
 
 
-# -------- Ray Actor for Persistent Evaluation --------
+# -------- Ray Actor for Persistent Evaluation (batched) --------
 @ray.remote
 class Evaluator:
-    def __init__(self,
-                 mesh_path: str,
-                 robot_urdf: str,
-                 flags: int):
+    """
+    Ray actor that holds one persistent pybullet DIRECT client and exposes evaluate_batch(...)
+    items: list of tuples (x, targets, targets_offset, robot_translations, mobile_base_translations,
+                          min_j, max_j, alpha, beta, delta, gamma)
+    """
+    def __init__(self, mesh_path: str, robot_urdf: str, flags: int):
+        # local import so actor process has pybullet available even if driver env differs
         import pybullet as p, pybullet_data
         self.p = p
-        self.p.connect(p.DIRECT)
-        self.p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        self.p.setGravity(0, 0, -9.81)
-
+        self.pybullet_data = pybullet_data
         self.robot_urdf = robot_urdf
         self.flags = flags
+        # create one DIRECT client for this actor process
+        self._cid = p.connect(p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
 
-        # single‐time mesh load
-        self.tree_collision_shape = self.p.createCollisionShape(
-            shapeType=self.p.GEOM_MESH,
-            fileName=mesh_path,
-            flags=self.p.GEOM_FORCE_CONCAVE_TRIMESH
+        # NOTE: Original code created a collision shape once in __init__.
+        # many pybullet users find that resetSimulation invalidates handles, so
+        # for safety we will (re)create collision shapes inside each evaluation.
+        # But we keep other persistent items (like URDF path) here.
+        self._mesh_path = mesh_path
+
+    def _evaluate_single(self, x,
+                         targets_list, targets_offset_list,
+                         robot_translations_list, mobile_base_translations_list,
+                         min_j, max_j,
+                         alpha, beta, delta, gamma):
+        """
+        Almost identical to your original Evaluator.evaluate(...) body but
+        adapted to run inside the actor's single persistent pybullet client.
+        This function uses self.p (pybullet module) and the single client self._cid.
+        """
+        p = self.p
+        cid = self._cid
+
+        # reset simulation state at the start of each evaluation to keep
+        # per-eval worlds independent and deterministic
+        p.resetSimulation()
+
+        # restore common global state for this client
+        p.setGravity(0, 0, -9.81)
+
+        # create or load any per-eval objects needed
+        # create tree collision shape fresh (safe wrt resetSimulation)
+        tree_collision_shape = p.createCollisionShape(
+            shapeType=p.GEOM_MESH,
+            fileName=self._mesh_path,
+            flags=p.GEOM_FORCE_CONCAVE_TRIMESH
         )
 
-    def evaluate(self, x, 
-                 targets_list, targets_offset_list,
-                 robot_translations_list, mobile_base_translations_list,
-                 min_j, max_j,
-                 alpha, beta, delta, gamma):
-        p = self.p    
-        p.setGravity(0, 0, -9.81)   
-        self.object_loader = LoadObjects(p)
+        # create object loader tied to this client (your LoadObjects expects a pybullet module)
+        object_loader = LoadObjects(p)
 
-        n_positions = len(robot_translations_list)
-        assert n_positions == len(mobile_base_translations_list) == len(targets_list) == len(targets_offset_list), \
-            "All lists of per-base inputs must have the same length"
-        
-        # load robot at a default position
-        # (this will be overridden in the loop below)
-        self.amiga_id = self.object_loader.load_urdf(
+        # load robot base (this will be repositioned per evaluation)
+        amiga_id = object_loader.load_urdf(
             self.robot_urdf,
             start_pos=[0, 0, 0],
-            start_orientation=[0,0,0],
+            start_orientation=[0, 0, 0],
             fix_base=True,
             flags=self.flags
         )
 
-        # load tree
-        self.tree_id = p.createMultiBody(
-            baseCollisionShapeIndex=self.tree_collision_shape,
+        # load the tree body (use the freshly created collision shape)
+        tree_id = p.createMultiBody(
+            baseCollisionShapeIndex=tree_collision_shape,
             baseVisualShapeIndex=-1,
-            basePosition=[0,0,0]
+            basePosition=[0, 0, 0]
         )
-        self.object_loader.collision_objects.extend([self.amiga_id, self.tree_id])
+        object_loader.collision_objects.extend([amiga_id, tree_id])
 
-        # decode kinematic chain
+        # decode candidate kinematic chain (uses your decode_decision_vector)
         n, types, axes, lengths = decode_decision_vector(x, min_j, max_j)
 
         ch = KinematicChainPyBullet(
             p, [0, 0, 0],
             n, types, axes, lengths,
-            collision_objects=self.object_loader.collision_objects
+            collision_objects=object_loader.collision_objects
         )
 
         if not ch.is_built:
             ch.build_robot()
         ch.load_robot()
 
+        n_positions = len(robot_translations_list)
+        assert n_positions == len(mobile_base_translations_list) == len(targets_list) == len(targets_offset_list), \
+            "All lists of per-base inputs must have the same length"
+
         for i in range(n_positions):
-            self.p.resetBasePositionAndOrientation(
-                self.amiga_id,
+            p.resetBasePositionAndOrientation(
+                amiga_id,
                 mobile_base_translations_list[i],
-                self.p.getQuaternionFromEuler([0, 0, 0])
+                p.getQuaternionFromEuler([0, 0, 0])
             )
-            self.p.resetBasePositionAndOrientation(
+            p.resetBasePositionAndOrientation(
                 ch.robot.robotId,
                 robot_translations_list[i],
-                self.p.getQuaternionFromEuler([0, 0, 0])
+                p.getQuaternionFromEuler([0, 0, 0])
             )
-            self.p.resetBasePositionAndOrientation(
-                self.tree_id,
+            p.resetBasePositionAndOrientation(
+                tree_id,
                 [0, 0, 0],
-                self.p.getQuaternionFromEuler([0, 0, 0])
+                p.getQuaternionFromEuler([0, 0, 0])
             )
-            
+
             targets = ch.sample_collision_free_poses(targets_list[i])
             targets_offset = ch.sample_collision_free_poses(targets_offset_list[i])
-
             ch.compute_chain_metrics(targets, targets_offset)
 
         ch.compute_chain_metric_stats()
 
-        # cleanup
+        # cleanup by resetting simulation again so no state leaks between evals
         p.resetSimulation()
 
         return {
@@ -126,8 +165,29 @@ class Evaluator:
             'pos_error_rrmc':         ch.mean_pos_error_rrmc
         }
 
+    def evaluate_batch(self, items):
+        """
+        items: list of tuples matching the args to _evaluate_single:
+            (x, targets_list, targets_offset_list, robot_translations_list,
+             mobile_base_translations_list, min_j, max_j, alpha, beta, delta, gamma)
 
-# -------- Problem Definition --------
+        Returns: list of result dicts in the same order.
+        """
+        results = []
+        for itm in items:
+            # itm is expected to exactly match the arguments we pass from _evaluate
+            res = self._evaluate_single(*itm)
+            results.append(res)
+        return results
+
+    def close(self):
+        try:
+            self.p.disconnect(self._cid)
+        except Exception:
+            pass
+
+
+# -------- Problem Definition (same structure but batch-aware) --------
 class KinematicChainProblem(Problem):
     def __init__(self, targets, targets_offset, robot_translation, mobile_base_translation,
                  seeds, dec_vec_bounds, min_joints=2, max_joints=7,
@@ -153,6 +213,8 @@ class KinematicChainProblem(Problem):
         mesh_path = os.path.join(script_dir, "meshes", "before_mesh_transformed.obj")
         robot_urdf = os.path.join(script_dir, "urdf", "robots", "amiga.urdf")
         flags = 0
+
+        # spawn ray actors (each actor holds one local DIRECT pybullet client)
         self.actors = [
             Evaluator.options(max_concurrency=1).remote(
                 mesh_path,
@@ -165,10 +227,6 @@ class KinematicChainProblem(Problem):
         self._parallel_calibration()
 
     def _make_calibration_batch(self, seeds, cal_samples):
-        """
-        Take up to cal_samples from provided seeds, 
-        then fill the rest with uniform random draws.
-        """
         seeds = [np.asarray(s, float) for s in seeds]
         n_var = len(self.xl)
         # sanity check
@@ -193,22 +251,34 @@ class KinematicChainProblem(Problem):
         mobile_base_translation = [self.mobile_base_translation[location_idx]]
         targets = [self.targets[location_idx]]
         targets_offset = [self.targets_offset[location_idx]]
-        
-        # round-robin assignment
-        futures = []
-        for i, x in enumerate(self._x_cal):
-            actor = self.actors[i % len(self.actors)]
-            futures.append(actor.evaluate.remote(
+
+        # Prepare items for evaluate_batch
+        items = []
+        for x in self._x_cal:
+            items.append((
                 x, targets, targets_offset,
                 robot_translation, mobile_base_translation,
                 self.min_joints, self.max_joints,
                 self.alpha, self.beta, self.delta, self.gamma
             ))
-        res = ray.get(futures)
+
+        # round-robin assign chunks across actors
+        n_actors = len(self.actors)
+        chunk_size = int(math.ceil(len(items) / max(1, n_actors)))
+        futures = []
+        for i, actor in enumerate(self.actors):
+            start = i * chunk_size
+            stop = min((i + 1) * chunk_size, len(items))
+            if start >= stop:
+                continue
+            chunk = items[start:stop]
+            futures.append(actor.evaluate_batch.remote(chunk))
+        chunks = ray.get(futures)
+        res = [r for chunk in chunks for r in chunk]
 
         def bounds(arr):
             lo, hi = min(arr), max(arr)
-            return (lo, hi if hi>lo else lo+1e-6)
+            return (lo, hi if hi > lo else lo + 1e-6)
 
         self.pose_bounds   = bounds([r['pose_error'] for r in res])
         self.rrt_bounds    = bounds([r['rrt_path_cost'] for r in res])
@@ -218,19 +288,41 @@ class KinematicChainProblem(Problem):
         self.jcount_bounds = bounds([r['joint_count'] for r in res])
 
     def _evaluate(self, X, out, *args, **kwargs):
-        futures = []
+        # Prepare batched items for each decision vector in X
+        items = []
         for i in range(X.shape[0]):
-            actor = self.actors[i % len(self.actors)]
-            futures.append(actor.evaluate.remote(
+            items.append((
                 X[i], self.targets, self.targets_offset,
                 self.robot_translation, self.mobile_base_translation,
                 self.min_joints, self.max_joints,
                 self.alpha, self.beta, self.delta, self.gamma
             ))
-        res = ray.get(futures)
 
-        # assemble F just as before…
+        # Distribute chunks across actors (contiguous chunks)
+        n_actors = len(self.actors)
+        chunk_size = int(math.ceil(len(items) / max(1, n_actors)))
+        futures = []
+        actor_chunks_info = []  # for reconstructing order
+        for i, actor in enumerate(self.actors):
+            start = i * chunk_size
+            stop = min((i + 1) * chunk_size, len(items))
+            if start >= stop:
+                continue
+            chunk = items[start:stop]
+            actor_chunks_info.append((actor, start, stop))
+            futures.append(actor.evaluate_batch.remote(chunk))
+
+        # collect results
+        chunks = ray.get(futures)
+        # flatten preserving original order
+        res = [None] * len(items)
+        for (actor, start, stop), chunk_res in zip(actor_chunks_info, chunks):
+            for local_idx, r in enumerate(chunk_res):
+                res[start + local_idx] = r
+
+        # assemble F
         F = np.zeros((X.shape[0], self.n_obj))
+
         def lin(v, lo, hi):
             return np.clip((v - lo) / max(1e-8, hi - lo), 0, 1)
 
@@ -247,11 +339,7 @@ class KinematicChainProblem(Problem):
             F[i, 2] = self.delta * lin(r['joint_count'], jc_lo, jc_hi)
             F[i, 3] = self.gamma * abs(r['conditioning_index'] - 1)
 
-            # F[i, 4] = lin(r['delta_joint_score_rrmc'], d_lo, d_hi)
-            # F[i, 5] = lin(r['pos_error_rrmc'], pr_lo, pr_hi)
-            w_delta_rrmc, w_pos_rrmc = 0.5, 0.5   # or tune to your preferences
-
-            # in _evaluate, replace the two objectives at indices 4,5 with one:
+            w_delta_rrmc, w_pos_rrmc = 0.5, 0.5
             F[i, 4] = (w_delta_rrmc * lin(r['delta_joint_score_rrmc'], d_lo, d_hi)
                        + w_pos_rrmc   * lin(r['pos_error_rrmc'],      pr_lo, pr_hi))
             F[i, 5] = lin(r['rrt_path_cost'], rr_lo, rr_hi)
@@ -276,69 +364,64 @@ if __name__ == "__main__":
     ######################### STAGE INPUTS #########################
     use_wandb = args.wandb
     use_mixed = args.mixed
-    
-    # Setup kinematic chain parameters
+
     min_joints = args.min_joints
     max_joints = args.max_joints
-    joint_type_bounds = (0, 2)  # 0: revolute, 1: prismatic, 2: fixed
-    joint_axis_bounds = (0, 2)  # 0: x-axis, 1: y-axis, 2: z-axis
-    link_length_bounds = (0.05, 0.75)  # min and max link length
 
-    # Setup problem parameters
+    joint_type_bounds = (0, 2)  # 0: revolute, 1: prismatic, 2: fixed
+    joint_axis_bounds = (0, 2)
+    link_length_bounds = (0.05, 0.75)
+
     num_generations = args.generations
     num_population = args.population
     calibration_samples = args.calibration_samples
-    num_objectives = 6  # pose_error, torque, joint_count, conditioning_index, rrmc_score, rrt_path_cost
-    num_actors = os.cpu_count()  # tune this to control memory vs. throughput
+    num_objectives = 6
+
+    # choose number of actors based on available CPUs
+    available_cpus = os.cpu_count() or 1
+    num_actors = max(1, available_cpus)  # you can tune this: set smaller if you want fewer processes
+    print(f"[main] available_cpus={available_cpus}, num_actors={num_actors}")
+
+    # initialize Ray with a CPU budget matching actor count
     ray.init(num_cpus=num_actors)
 
-    # Set the robot starting position and translation
-    # CURRENT MESH X-BOUND: [-6.2, 7.7]
     robot_to_amiga_translation = [0, 0, 1.025]
     amiga_to_robot_translation = [0, -0.3, 0]
     robot_system_locations = [[-4.0, -2.25, 0.0], [-1.5, -2.25, 0.0], [1.0, -2.25, 0.0], [3.5, -2.25, 0.0], [6.0, -2.25, 0.0]]
-    
-    # Specify the window position and size for the loaded prune points (only uses prune points within this window)
+
     window_x_positions = [loc[0] for loc in robot_system_locations]
     window_size = 2.5
 
-    # Data directory for saving results
     data_dir = 'data/nsga2_results'
     os.makedirs(data_dir, exist_ok=True)
     ################################################################
     ################################################################
 
-    # decision vector bounds
     xl = [min_joints] + [joint_type_bounds[0], joint_axis_bounds[0], link_length_bounds[0]] * max_joints
     xu = [max_joints] + [joint_type_bounds[1], joint_axis_bounds[1], link_length_bounds[1]] * max_joints
     decision_vector_bounds = (xl, xu)
     var_types = ['int'] + ['int','int','real'] * max_joints
 
-    # Find the urdf seeds
     script_dir = os.path.dirname(os.path.abspath(__file__))
     urdf_dir = os.path.join(script_dir, 'urdf', 'robots', 'nsga2_seeds')
     seeds = load_seeds(urdf_dir, max_joints=max_joints)
 
-    # Load the robot system translation
+    # Load the robot system translation and prune poses
     robot_translations = []
     amiga_translations = []
     target_poses_list = []
     target_offset_poses_list = []
     for robot_system_translation in robot_system_locations:
-        # Calculate the robot and amiga translations based on the system translation
-        # This assumes the robot is always at the origin of the mobile base
-        # and the amiga is offset by a fixed translation.
         robot_translations.append(np.add(robot_to_amiga_translation, robot_system_translation))
         amiga_translations.append(np.add(amiga_to_robot_translation, robot_system_translation))
 
-        # Load the prune poses from the YAML file
         pose_data_results = orchard_ws.get_prune_poses_from_yaml(
             yaml_path='manipulator_codesign/prune_data/all_branches_info.yaml',
             robot_base=robot_translations[-1],
             window_size=window_size,
             min_y=None,
             max_y=0.0,
-            )
+        )
         target_poses, target_offset_poses = orchard_ws.package_poses(pose_data_results)
         target_poses_list.append(target_poses)
         target_offset_poses_list.append(target_offset_poses)
@@ -358,7 +441,6 @@ if __name__ == "__main__":
         num_objectives=num_objectives,
     )
 
-    # setup callbacks
     callback = CheckpointCallback(out_dir=data_dir, every=1, keep_last=5)
 
     if use_wandb:
@@ -386,7 +468,6 @@ if __name__ == "__main__":
         )
         callback = CombinedCallback(callback, WandbLogger())
 
-    # algorithm selection
     if use_mixed:
         sampling  = SeededSampling(var_types, seeds, MixedSampling(var_types))
         crossover = MixedCrossover(var_types)
@@ -409,7 +490,6 @@ if __name__ == "__main__":
             eliminate_duplicates=True
         )
 
-    # dynamic minimize call: include callback only if set
     minimize_kwargs = {
         'problem': problem,
         'algorithm': algo,
@@ -422,7 +502,6 @@ if __name__ == "__main__":
 
     res = minimize(**minimize_kwargs)
 
-    # save results locally
     fn = os.path.join(data_dir, f"results_{datetime.now():%Y%m%d_%H%M%S}.pkl")
     with open(fn, 'wb') as f:
         pickle.dump({'X': res.X, 'F': res.F}, f)
@@ -433,3 +512,6 @@ if __name__ == "__main__":
         artifact.add_file(fn)
         wandb.log_artifact(artifact)
         wandb.finish()
+
+    # teardown Ray actors by shutting down Ray
+    ray.shutdown()

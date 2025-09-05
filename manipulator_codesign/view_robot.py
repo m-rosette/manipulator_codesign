@@ -2,12 +2,16 @@ import os
 import argparse
 import numpy as np
 import time
+import pybullet as p
 from scipy.spatial.transform import Rotation as R
 from pybullet_robokit.pyb_utils import PybUtils
 from pybullet_robokit.load_objects import LoadObjects
 from pybullet_robokit.load_robot import LoadRobot
 from pybullet_robokit.motion_planners import KinematicChainMotionPlanner
 import manipulator_codesign.orchard_workspace as orchard_ws
+from manipulator_codesign.kinematic_chain import KinematicChainPyBullet
+from manipulator_codesign.moo_decoder import decode_decision_vector
+from manipulator_codesign.urdf_to_decision_vector import urdf_to_decision_vector, encode_seed
 
 
 def get_urdf_path(user_input, default_dir, default_file):
@@ -41,19 +45,22 @@ class ViewRobot:
             robot_urdf_path (str): Path to the URDF file of the robot.
             robot_home_pos (list): Home position of the robot joints.
             ik_tol (float, optional): Tolerance for inverse kinematics. Defaults to 0.01.
-            renders (bool, optional): Whether to visualize the robot in the PyBullet GUI. Defaults to True.
+            renders (bool, optional): Whether to visualize the robot in the PyBullet GUI. Defaults to True.x
         """
         self.pyb = PybUtils(renders=renders)
         self.object_loader = LoadObjects(self.pyb.con)
 
+        self.robot_urdf_path = robot_urdf_path
+
         robot_to_amiga_translation = [0, 0, 1.025]
         amiga_to_robot_translation = [0, -0.3, 0]
         # self.robot_system_translation = [-4.0, -2.5, 0.0]
-        self.robot_system_translation = [0, -2.5, 0]
+        self.robot_system_translation = [-4.0, -2.0, 0]
 
+        self.robot_translation = np.add(robot_to_amiga_translation, self.robot_system_translation)
         self.robot = LoadRobot(self.pyb.con, 
                                robot_urdf_path, 
-                               np.add(robot_to_amiga_translation, self.robot_system_translation), 
+                               self.robot_translation, 
                                self.pyb.con.getQuaternionFromEuler([0, 0, 0]), 
                                robot_home_pos, 
                                collision_objects=self.object_loader.collision_objects,
@@ -69,18 +76,47 @@ class ViewRobot:
                                         flags=flags)
         self.object_loader.collision_objects.append(self.amiga_id)
 
-        # Load tree collision shape
-        collision_shape = self.robot.con.createCollisionShape(
-            shapeType=self.robot.con.GEOM_MESH,
-            fileName="/home/marcus/IMML/manipulator_codesign/external/pybullet_robokit/pybullet_robokit/meshes/before_mesh_transformed.obj",
-            flags=self.robot.con.GEOM_FORCE_CONCAVE_TRIMESH,
-        )
-        # Create your body using this multi‐hull collision shape
-        body_id = self.robot.con.createMultiBody(
-            baseCollisionShapeIndex=collision_shape,
-            baseVisualShapeIndex=-1,
-            basePosition=[0,0,0]
-        )
+        pretty_mesh = False
+        if pretty_mesh:
+            filename = "/manipulator_codesign/manipulator_codesign/meshes/Pair01_before_mesh.obj"
+            # Load tree collision shape
+            collision_shape = self.robot.con.createCollisionShape(
+                shapeType=self.robot.con.GEOM_MESH,
+                fileName=filename,
+                flags=self.robot.con.GEOM_FORCE_CONCAVE_TRIMESH,
+            )
+            # Create a visual shape with light brown color (RGBA)
+            visual_shape = self.robot.con.createVisualShape(
+                shapeType=self.robot.con.GEOM_MESH,
+                fileName=filename,
+                rgbaColor=[0.71, 0.40, 0.16, 1.0]  # light brown, alpha=1.0
+            )
+            # Create your body using this multi‐hull collision shape
+            body_id = self.robot.con.createMultiBody(
+                baseCollisionShapeIndex=collision_shape,
+                baseVisualShapeIndex=visual_shape,
+                basePosition=[-5.7, -1.905, 0]
+            )
+        else:
+            filename = "/manipulator_codesign/manipulator_codesign/meshes/before_mesh_transformed.obj"
+            # Load tree collision shape
+            collision_shape = self.robot.con.createCollisionShape(
+                shapeType=self.robot.con.GEOM_MESH,
+                fileName=filename,
+                flags=self.robot.con.GEOM_FORCE_CONCAVE_TRIMESH,
+            )
+            # Create a visual shape with light brown color (RGBA)
+            visual_shape = self.robot.con.createVisualShape(
+                shapeType=self.robot.con.GEOM_MESH,
+                fileName=filename,
+                rgbaColor=[0.71, 0.40, 0.16, 1.0]  # light brown, alpha=1.0
+            )
+            # Create your body using this multi‐hull collision shape
+            body_id = self.robot.con.createMultiBody(
+                baseCollisionShapeIndex=collision_shape,
+                baseVisualShapeIndex=visual_shape,
+                basePosition=[0,0,0]
+            )
         self.object_loader.collision_objects.append(body_id)
 
         self.ik_tol = ik_tol
@@ -121,7 +157,16 @@ class ViewRobot:
 
     def test_resolved_rate_motion_control(self):
         # input("Press Enter to start the resolved rate motion control test...")
-        target_pos = [0, 1.5, 1.5]
+        target_pos = [-4, -1, 1.5]
+
+        target_point_id = self.object_loader.load_urdf(
+            "sphere2.urdf",
+            start_pos=target_pos,
+            start_orientation=[0, 0, 0],
+            fix_base=True,
+            radius=0.05
+        )
+
         motion_planner = KinematicChainMotionPlanner(self.robot)
 
         target_orientations = [
@@ -235,72 +280,67 @@ class ViewRobot:
         while True:
             self.pyb.con.stepSimulation()
 
-    def test_prune_point_orientation(self):
-        # Define the window position and size for filtering prune points and point cloud data
-        window_x_pos = self.robot_system_translation[0]
-        window_size = 3
-
+    def get_filtered_prune_points(self, window_size=2.5):
         # Load the prune points from the YAML file
-        prune_points, base_directions, base_points = orchard_ws.extract_prune_points(
-            "/home/marcus/IMML/manipulator_codesign/results/all_branches_info.yaml"
+        pose_data_results = orchard_ws.get_prune_poses_from_yaml(
+            yaml_path="manipulator_codesign/prune_data/all_branches_info.yaml",
+            robot_base=self.robot_translation,
+            window_size=window_size,
+            min_y=None,
+            max_y=0
         )
+        target_poses, target_offset_poses = orchard_ws.package_poses(pose_data_results)
 
-        # Filter prune points based on robot’s current x-position and window size
-        filtered_prune_points, filtered_base_directions, filtered_base_points = orchard_ws.filter_prune_points(
-            prune_points, base_directions, base_points, window_x_pos, window_size
-        )
+        # Remove the robot if it was previously loaded (planning to use the chain version)
+        self.pyb.con.removeBody(self.robot.robotId)
 
-        # Query robot base in world coordinates
-        robot_base_position, _ = self.robot.con.getBasePositionAndOrientation(self.robot.robotId)
+        raw_robot_params = urdf_to_decision_vector(self.robot_urdf_path)
+        x = encode_seed(raw_robot_params, min_joints=5, max_joints=7)
+        n, types, axes, lengths = decode_decision_vector(x, min_joints=5, max_joints=7)
+        chain = KinematicChainPyBullet(self.pyb.con, self.robot_translation, n, types, axes, lengths, collision_objects=self.object_loader.collision_objects)
+        chain.build_robot()
+        chain.load_robot()
 
+        # if target_poses has a None type, print the index and remove it
+        # target_poses = [pose for pose in target_poses if pose is not None]
+        poses_collision_free = chain.sample_collision_free_poses(target_poses)
+        return poses_collision_free, chain
+    
+    def test_prune_point_orientation(self):
+        poses_collision_free, chain = self.get_filtered_prune_points(window_size=2.5)
+        target_point_id = None
         # Iterate through the filtered prune points and visualize them
-        for point, direction, base in zip(filtered_prune_points,
-                                        filtered_base_directions,
-                                        filtered_base_points):
+        for pose in poses_collision_free:
             input("Press Enter to visualize the next prune point...")
 
-            # Compute the best perpendicular pose by sampling around the branch axis
-            position, orientation = orchard_ws.prune_pose(
-                point,              # prune point location
-                direction,          # branch direction ⇒ local z-axis
-                base,               # branch base (unused fallback)
-                robot_base_position,# robot base ⇒ minimization target
-                num_samples=60,     # you can tune this
-                radius=0.1          # offset distance perpendicular to branch
-            )
+            # if target_point_id is not None:
+            #     # Remove the previous target point after reaching it
+            #     self.pyb.con.removeBody(target_point_id) 
 
-            print(
-                f"Prune Point: {point}, "
-                f"Direction: {direction}, "
-                f"Branch Base: {base}, "
-                f"Robot Base: {robot_base_position}, "
-                f"Selected Pose ⇒ pos={position}, quat={orientation}"
-            )
-
-            # Spawn a little marker at that prune point
-            target_point_id = self.object_loader.load_urdf(
-                "sphere2.urdf",
-                start_pos=position,
-                start_orientation=[0, 0, 0],
-                fix_base=True,
-                radius=0.05
-            )
+            # # Spawn a little marker at that prune point
+            # target_point_id = self.object_loader.load_urdf(
+            #     "sphere2.urdf",
+            #     start_pos=pose[0],
+            #     start_orientation=[0, 0, 0],
+            #     fix_base=True,
+            #     radius=0.05
+            # )
 
             # Reset robot to home, then move to target via IK
-            self.robot.set_joint_configuration(self.robot.home_config)
-            joint_config = self.robot.inverse_kinematics(
-                (position, orientation),
+            chain.robot.set_joint_configuration(chain.robot.home_config)
+            joint_config = chain.robot.inverse_kinematics(
+                pose,
                 pos_tol=self.ik_tol,
                 max_iter=1000,
                 resample=False
             )
-            self.robot.reset_joint_positions(joint_config)
-            self.robot.set_joint_configuration(joint_config)
+            chain.robot.reset_joint_positions(joint_config)
+            chain.robot.set_joint_configuration(joint_config)
 
-            # Step simulation and render
-            for _ in range(240):
-                self.pyb.con.stepSimulation()
-                time.sleep(1.0 / 240.0)
+            # # Step simulation and render
+            # for _ in range(240):
+            #     self.pyb.con.stepSimulation()
+            #     time.sleep(1.0 / 240.0)
 
     def main(self):
         target_positions = np.random.uniform(low=[0, 0, 0], high=[2.0, 2.0, 2.0], size=(20, 3)).tolist()
@@ -364,8 +404,8 @@ if __name__ == "__main__":
                            ik_tol=0.01,
                            ee_link_name=ee_link_name)
     
-    # view_robot.test_resolved_rate_motion_control()
+    view_robot.test_resolved_rate_motion_control()
     # view_robot.main() 
-    view_robot.rrt_path_test()
+    # view_robot.rrt_path_test()
     # view_robot.test_collisions()
     # view_robot.test_prune_point_orientation()

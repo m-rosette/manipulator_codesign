@@ -167,24 +167,103 @@ class KinematicChainPyBullet(KinematicChainBase):
         # Initialize motion planner
         self.motion_planner = KinematicChainMotionPlanner(self.robot)
 
-    def sample_collision_free_poses(self, pose_candidates):
+    # def sample_collision_free_poses(self, pose_candidates):
+    #     target_poses = []
+
+    #     for target_candidate in pose_candidates:
+    #         for j, target_pose in enumerate(target_candidate):
+    #             target_pose = tuple(target_pose)
+    #             joint_config = self.robot.inverse_kinematics(target_pose)
+    #             self.robot.reset_joint_positions(joint_config)
+    #             if not self.robot.collision_check(self.robot.robotId, self.collision_objects):
+    #                 target_poses.append(target_pose)
+    #                 break
+    #         else:
+    #             # If we never `break`, no collision-free orientation was found.
+    #             # Use the last pose's position but a default “front-facing (+y)” quaternion.
+    #             last_pose = target_candidate[-1]
+    #             pos = np.asarray(last_pose[0])
+    #             default_quat = R.from_euler('xyz', [90, 0, 180], degrees=True).as_quat()
+    #             fallback = (pos, default_quat)
+    #             target_poses.append(fallback)
+
+    #     return target_poses
+
+    def sample_collision_free_poses(self, pose_candidates, ik_round_decimals=3):
+        """
+        Faster sampling by:
+        - localizing method lookups
+        - cheap reachability filter (if robot.max_reach present)
+        - IK result caching (rounded)
+        - avoid redundant joint resets
+        """
         target_poses = []
 
+        # Local refs for speed
+        inv_ik = self.robot.inverse_kinematics
+        reset_joints = self.robot.reset_joint_positions
+        collision_check = self.robot.collision_check
+        robotId = self.robot.robotId
+        collision_objects = self.collision_objects
+
+        # Optional info for reachability filter
+        max_reach = getattr(self.robot, "max_reach", None)
+        base_pos, base_ori = self.robot.con.getBasePositionAndOrientation(self.robot.robotId)
+
+        # Caches and helpers
+        ik_cache = {}
+        last_set_config = None
+
+        # compute default quaternion once
+        default_quat = R.from_euler("xyz", [90, 0, 180], degrees=True).as_quat()
+
         for target_candidate in pose_candidates:
-            for j, target_pose in enumerate(target_candidate):
-                target_pose = tuple(target_pose)
-                joint_config = self.robot.inverse_kinematics(target_pose)
-                self.robot.reset_joint_positions(joint_config)
-                if not self.robot.collision_check(self.robot.robotId, self.collision_objects):
-                    target_poses.append(target_pose)
+            picked = False
+
+            for target_pose in target_candidate:
+                pos, quat = target_pose
+                pos = np.asarray(pos)
+
+                # Cheap reachability check: skip IK if clearly out of reach
+                if max_reach is not None:
+                    if np.linalg.norm(pos - base_pos) > max_reach:
+                        continue
+
+                # Build cache key by rounding position+quat to reduce IK calls for near-identical poses
+                key = (
+                    round(pos[0], ik_round_decimals),
+                    round(pos[1], ik_round_decimals),
+                    round(pos[2], ik_round_decimals),
+                    round(quat[0], ik_round_decimals),
+                    round(quat[1], ik_round_decimals),
+                    round(quat[2], ik_round_decimals),
+                    round(quat[3], ik_round_decimals),
+                )
+
+                joint_config = ik_cache.get(key)
+                if joint_config is None:
+                    joint_config = inv_ik((pos, quat))
+                    # you might want to check if IK failed (None or invalid)
+                    ik_cache[key] = joint_config
+
+                # Only reset joints if the config changed from the last one we set
+                if last_set_config is None or not np.allclose(joint_config, last_set_config):
+                    reset_joints(joint_config)
+                    # copy to avoid referencing a mutable object that might change later
+                    last_set_config = np.array(joint_config, copy=True)
+
+                # collision_check is expected to test the whole robot against collision_objects
+                if not collision_check(robotId, collision_objects):
+                    # append pose as tuples (immutable)
+                    target_poses.append((tuple(pos), tuple(quat)))
+                    picked = True
                     break
-            else:
-                # If we never `break`, no collision-free orientation was found.
-                # Use the last pose's position but a default “front-facing (+y)” quaternion.
+
+            if not picked:
+                # fallback: use last pose position and default quaternion
                 last_pose = target_candidate[-1]
                 pos = np.asarray(last_pose[0])
-                default_quat = R.from_euler('xyz', [90, 0, 180], degrees=True).as_quat()
-                fallback = (pos, default_quat)
+                fallback = (tuple(pos), tuple(default_quat))
                 target_poses.append(fallback)
 
         return target_poses
