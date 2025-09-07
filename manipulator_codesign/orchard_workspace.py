@@ -3,7 +3,7 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from sklearn.cluster import DBSCAN
 
 
 def extract_prune_points(yaml_path):
@@ -37,9 +37,21 @@ def extract_prune_points(yaml_path):
 
     return prune_points, base_directions, base_points
 
-def filter_prune_points(prune_points, base_directions, base_points, window_x_pos, window_size=0.5, min_y=None, max_y=None):
+def filter_prune_points(
+    prune_points,
+    base_directions,
+    base_points,
+    window_x_pos,
+    window_size=0.5,
+    min_y=None,
+    max_y=None,
+    downsample=False,
+    downsample_threshold=0.1,
+    min_samples=1
+):
     """
-    Filters prune points based on their x-position, a specified window size, and optional y-bounds.
+    Filters prune points based on their x-position, a specified window size, optional y-bounds,
+    and (optionally) downsamples using DBSCAN clustering.
 
     Parameters:
         prune_points (np.ndarray): Array of prune points with shape (N, 3).
@@ -49,17 +61,58 @@ def filter_prune_points(prune_points, base_directions, base_points, window_x_pos
         window_size (float): The size of the window to use for filtering.
         min_y (float, optional): Minimum y-value to include. Defaults to None.
         max_y (float, optional): Maximum y-value to include. Defaults to None.
+        downsample (bool): Whether to apply DBSCAN clustering to reduce close points.
+        downsample_threshold (float): Distance threshold (DBSCAN `eps`) for clustering.
+        min_samples (int): DBSCAN `min_samples` parameter.
 
     Returns:
-        tuple: Filtered arrays of prune points, base directions, and base points.
+        tuple: Filtered (and optionally downsampled) arrays of prune points, base directions, and base points.
     """
+    # Step 1: Apply window filtering
     x_min, x_max = get_filtered_window_bounds(window_x_pos, window_size)
     mask = (prune_points[:, 0] >= x_min) & (prune_points[:, 0] <= x_max)
     if min_y is not None:
         mask &= (prune_points[:, 1] >= min_y)
     if max_y is not None:
         mask &= (prune_points[:, 1] <= max_y)
-    return prune_points[mask], base_directions[mask], base_points[mask]
+
+    filtered_points = prune_points[mask]
+    filtered_dirs = base_directions[mask]
+    filtered_bases = base_points[mask]
+
+    if filtered_points.shape[0] == 0:
+        return filtered_points, filtered_dirs, filtered_bases
+
+    # Step 2: Optionally downsample via DBSCAN
+    if downsample:
+        clustering = DBSCAN(eps=downsample_threshold, min_samples=min_samples).fit(filtered_points[:, :2])  # x,y only
+        labels = clustering.labels_
+
+        unique_labels = np.unique(labels)
+        kept_points, kept_dirs, kept_bases = [], [], []
+
+        for label in unique_labels:
+            cluster_mask = labels == label
+            cluster_points = filtered_points[cluster_mask]
+            cluster_dirs = filtered_dirs[cluster_mask]
+            cluster_bases = filtered_bases[cluster_mask]
+
+            if label == -1:
+                # Noise points: keep them all
+                kept_points.append(cluster_points)
+                kept_dirs.append(cluster_dirs)
+                kept_bases.append(cluster_bases)
+            else:
+                # For clusters: keep just one representative (here, the first point)
+                kept_points.append(cluster_points[:1])
+                kept_dirs.append(cluster_dirs[:1])
+                kept_bases.append(cluster_bases[:1])
+
+        filtered_points = np.vstack(kept_points) if kept_points else np.empty((0, 3))
+        filtered_dirs = np.vstack(kept_dirs) if kept_dirs else np.empty((0, 3))
+        filtered_bases = np.vstack(kept_bases) if kept_bases else np.empty((0, 3))
+
+    return filtered_points, filtered_dirs, filtered_bases
 
 def prune_pose(point, direction, base_point, robot_base,
                num_samples=36, radius=0.1):
@@ -223,7 +276,7 @@ def prune_pose_candidates(point, direction, base_point, robot_base,
 
     return p, np.array(quaternions), np.array(offset_pts)
 
-def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None, max_y=None):
+def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None, max_y=None, downsample=False, downsample_threshold=0.1):
     # Check to see if yaml path is valid
     if not yaml_path or not isinstance(yaml_path, str):
         raise ValueError("Invalid YAML path provided.")
@@ -231,7 +284,8 @@ def get_prune_poses_from_yaml(yaml_path, robot_base, window_size=0.5, min_y=None
     prune_points, base_dirs, base_pts = extract_prune_points(yaml_path)
     filt_pts, filt_dirs, filt_bases = filter_prune_points(
         prune_points, base_dirs, base_pts, robot_base[0],
-        window_size, min_y=min_y, max_y=max_y
+        window_size, min_y=min_y, max_y=max_y,
+        downsample=downsample, downsample_threshold=downsample_threshold
     )
 
     all_results = []

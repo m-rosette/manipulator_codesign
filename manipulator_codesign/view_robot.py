@@ -54,10 +54,11 @@ class ViewRobot:
 
         self.ik_tol = ik_tol
 
-        # robot_to_amiga_translation = [0, 0, 1.025]
-        robot_to_amiga_translation = [0, 0, 0]
+        robot_to_amiga_translation = [0, 0, 1.025] 
+        # robot_to_amiga_translation = [0, 0, 0]
         amiga_to_robot_translation = [0, -0.3, 0]
-        self.robot_system_translation = [-4.0, -2.0, 0]
+        # self.robot_system_translation = [-4.0, -2.25, 0] # left-most position
+        self.robot_system_translation = [-1.5, -2.25, 0] # left-most position
 
         self.robot_translation = np.add(robot_to_amiga_translation, self.robot_system_translation)
         self.robot = LoadRobot(self.pyb.con, 
@@ -71,14 +72,14 @@ class ViewRobot:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         urdf_dir = os.path.join(script_dir, 'urdf')
         flags = 0 
-        # self.amiga_id = self.object_loader.load_urdf(os.path.join(urdf_dir, "robots/amiga.urdf"),
-        #                                 start_pos=np.add(amiga_to_robot_translation, self.robot_system_translation), 
-        #                                 start_orientation=[0, 0, 0], 
-        #                                 fix_base=True,
-        #                                 flags=flags)
-        # self.object_loader.collision_objects.append(self.amiga_id)
+        self.amiga_id = self.object_loader.load_urdf(os.path.join(urdf_dir, "robots/amiga.urdf"),
+                                        start_pos=np.add(amiga_to_robot_translation, self.robot_system_translation), 
+                                        start_orientation=[0, 0, 0], 
+                                        fix_base=True,
+                                        flags=flags)
+        self.object_loader.collision_objects.append(self.amiga_id)
 
-        pretty_mesh = None
+        pretty_mesh = False
         if pretty_mesh:
             filename = "/manipulator_codesign/manipulator_codesign/meshes/Pair01_before_mesh.obj"
             # Load tree collision shape
@@ -112,7 +113,7 @@ class ViewRobot:
             visual_shape = self.robot.con.createVisualShape(
                 shapeType=self.robot.con.GEOM_MESH,
                 fileName=filename,
-                rgbaColor=[0.71, 0.40, 0.16, 1.0]  # light brown, alpha=1.0
+                rgbaColor=[0.82, 0.55, 0.30, 1.0]  # light brown, alpha=1.0
             )
             # Create your body using this multi‐hull collision shape
             body_id = self.robot.con.createMultiBody(
@@ -283,16 +284,31 @@ class ViewRobot:
         while True:
             self.pyb.con.stepSimulation()
 
-    def get_filtered_prune_points(self, window_size=2.5):
+    def get_filtered_prune_points(self, window_size=2.5, downsample=False, downsample_threshold=0.1):
+        yaml_path = "manipulator_codesign/prune_data/all_branches_info.yaml"
+
+        # prune_points, base_dirs, base_pts = orchard_ws.extract_prune_points(yaml_path)
+        # filtered_prune_pts, filtered_prune_dirs, filtered_prune_bases = orchard_ws.filter_prune_points(
+        #     prune_points=prune_points, base_directions=base_dirs, base_points=base_pts, 
+        #     window_x_pos=self.robot_translation[0], window_size=window_size, min_y=None, max_y=0,
+        #     downsample=downsample, downsample_threshold=downsample_threshold
+        # )
+        # print(min(filtered_prune_pts, key=lambda x: x[0])[0], max(filtered_prune_pts, key=lambda x: x[0])[0])
+        # print("[get_filtered_prune_points] Filtered to", len(filtered_prune_pts), "prune points")
+
         # Load the prune points from the YAML file
         pose_data_results = orchard_ws.get_prune_poses_from_yaml(
             yaml_path="manipulator_codesign/prune_data/all_branches_info.yaml",
             robot_base=self.robot_translation,
             window_size=window_size,
             min_y=None,
-            max_y=0
+            max_y=0,
+            downsample=False,
+            downsample_threshold=0.1
         )
         target_poses, target_offset_poses = orchard_ws.package_poses(pose_data_results)
+        prune_points = [res['prune_point'] for res in pose_data_results]
+        print("[get_filtered_prune_points] Loaded", len(prune_points), "prune points from YAML")
 
         # Remove the robot if it was previously loaded (planning to use the chain version)
         self.pyb.con.removeBody(self.robot.robotId)
@@ -307,36 +323,46 @@ class ViewRobot:
         # if target_poses has a None type, print the index and remove it
         # target_poses = [pose for pose in target_poses if pose is not None]
         poses_collision_free = chain.sample_collision_free_poses(target_poses)
-        return poses_collision_free, chain
-    
-    def test_prune_point_orientation(self):
+        return prune_points, poses_collision_free, chain
+        
+    def test_prune_point_orientation(self, rrt_connect=False):
         self.pyb.con.removeBody(self.robot.robotId)
 
-        poses_collision_free, chain = self.get_filtered_prune_points(window_size=2.5)
+        prune_points, poses_collision_free, chain = self.get_filtered_prune_points(window_size=2.5, downsample=True, downsample_threshold=0.1)
+        print(f"Number of collision-free prune points: {len(poses_collision_free)}")
 
         # create a red sphere visual
         target_point_id = None
-        radius = 0.05
+        radius = 0.035
         red = [1, 0, 0, 1]  # RGBA
         visual_shape_id = self.robot.con.createVisualShape(
             shapeType=p.GEOM_SPHERE,
             radius=radius,
             rgbaColor=red
         )
-        # Iterate through the filtered prune points and visualize them
-        for pose in poses_collision_free:
-            input("Press Enter to visualize the next prune point...")
 
-            if target_point_id is not None:
-                # Remove the previous target point after reaching it
-                self.pyb.con.removeBody(target_point_id) 
-
+        for pt in prune_points:
             # Spawn a little marker at that prune point
             target_point_id = p.createMultiBody(
                 baseMass=0,  # 0 = static
                 baseVisualShapeIndex=visual_shape_id,
-                basePosition=pose[0]  # x, y, z
+                basePosition=pt  # x, y, z
             )
+
+        # Iterate through the filtered prune points and visualize them
+        for i, pose in enumerate(poses_collision_free):
+            input("Press Enter to visualize the next prune point...")
+
+            # if target_point_id is not None:
+            #     # Remove the previous target point after reaching it
+            #     self.pyb.con.removeBody(target_point_id) 
+
+            # # Spawn a little marker at that prune point
+            # target_point_id = p.createMultiBody(
+            #     baseMass=0,  # 0 = static
+            #     baseVisualShapeIndex=visual_shape_id,
+            #     basePosition=filtered_prune_pts[i]  # x, y, z
+            # )
 
             # Reset robot to home, then move to target via IK
             chain.robot.set_joint_configuration(chain.robot.home_config)
@@ -346,13 +372,32 @@ class ViewRobot:
                 max_iter=1000,
                 resample=False
             )
-            chain.robot.reset_joint_positions(joint_config)
-            chain.robot.set_joint_configuration(joint_config)
+            
+            if rrt_connect:
+                # Initialize the motion planner
+                motion_planner = KinematicChainMotionPlanner(self.robot)
 
-            # Step simulation and render
-            for _ in range(240):
-                # self.pyb.con.stepSimulation()
-                time.sleep(1.0 / 240.0)
+                # Pass the start and target configurations to the RRT planner
+                joint_path = motion_planner.rrt_path(chain.robot.home_config, joint_config, rrt_iter=100, collision_objects=self.object_loader.collision_objects, steps=None)
+
+                # Check if the path is valid
+                if joint_path is None:
+                    print("\nRRT path planning failed.\n")
+                    # return
+                    continue
+                else:
+                    print("\nRRT path planning succeeded.\n")
+
+                # Execute the planned joint path
+                self.robot.set_joint_path(joint_path)
+
+            else:
+                chain.robot.reset_joint_positions(joint_config)
+                chain.robot.set_joint_configuration(joint_config)
+
+        # Step simulation and render
+        while True:
+            self.pyb.con.stepSimulation()
 
     def basic_prune_point_viz(self):
         # create a red sphere visual
@@ -472,11 +517,11 @@ if __name__ == "__main__":
     # view_robot.main() 
     # view_robot.rrt_path_test()
     # view_robot.test_collisions()
-    # view_robot.test_prune_point_orientation()
+    view_robot.test_prune_point_orientation(rrt_connect=False)
     # view_robot.basic_prune_point_viz()
     # view_robot.command_to_joint_positions([0.25, -0.25, 0.5, -1.2, -0.5, 0.2, -1.0, 0.5, -1.5]) # For gen_seed_6
     # view_robot.command_to_joint_positions([-2, 0.5, -0.3, 0.2, 1.0, 0.5, -0.5]) # For gen_seed_0
     # view_robot.command_to_joint_positions([0, -0.25]) # For test_robot_7
     # view_robot.command_to_joint_positions([0, -0.25, 0, 0]) # For test_robot_8
     # view_robot.command_to_joint_positions([0, 0.5]) # For test_robot_9
-    view_robot.command_to_joint_positions([0.25, 0.1]) # For test_robot_10
+    # view_robot.command_to_joint_positions([0.05, -0.1]) # For test_robot_10
