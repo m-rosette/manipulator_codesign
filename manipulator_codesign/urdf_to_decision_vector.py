@@ -21,17 +21,36 @@ def parse_cylinder_lengths(urdf_path):
 
 def get_link_length(robot, joint_idx, cylinder_lengths):
     """
-    Returns the true cylinder length for the child link of `joint_idx`, 
+    Returns the true cylinder length for the child link of `joint_idx`,
     or 2x the distance between joint and child link if not present.
-    """
-    joint_pos = robot.con.getJointState(robot.robotId, joint_idx)[0]
-    child_pos = robot.con.getJointState(robot.robotId, joint_idx if robot.con.getJointInfo(robot.robotId, joint_idx)[2] == robot.con.JOINT_FIXED else joint_idx)[0]
-    child_name = robot.con.getJointInfo(robot.robotId, joint_idx)[12].decode()
 
+    Special rule: if the joint is prismatic and has non-zero limits,
+    return abs(lower_limit) + abs(upper_limit).
+    """
+    # Get joint info once
+    info = robot.con.getJointInfo(robot.robotId, joint_idx)
+    joint_type = info[2]
+    child_name = info[12].decode()
+
+    # If prismatic, try to use limits to define length
+    if joint_type == robot.con.JOINT_PRISMATIC:
+        lower_limit = info[8]
+        upper_limit = info[9]
+
+        # If limits appear meaningful (not both zero), use their absolute sum
+        try:
+            if (lower_limit is not None and upper_limit is not None) and (lower_limit != 0.0 or upper_limit != 0.0):
+                return float(abs(lower_limit) + abs(upper_limit))
+        except Exception:
+            # If anything odd happens, fall back to distance-based heuristic below
+            pass
+
+    # If the child link is listed as a cylinder, use its known length
     if child_name in cylinder_lengths:
         return cylinder_lengths[child_name]
-    else:
-        return 2.0 * np.linalg.norm(np.array(child_pos) - np.array(joint_pos))
+
+    # Fallback: TODO: need to find a smarter way to estimate length if not a cylinder
+    return 0.25
 
 def get_logical_joints(robot):
     """

@@ -13,7 +13,7 @@ from pybullet_robokit.motion_planners import KinematicChainMotionPlanner
 class KinematicChainBase:
     def __init__(self, num_joints, joint_types, joint_axes, link_lengths, 
                  robot_name='silly_robot', save_urdf_dir=None,
-                 joint_limit_prismatic=(-0.5, 0.5), joint_limit_revolute=(-2*np.pi, 2*np.pi)):
+                 joint_limit_prismatic=(-0.5, 0.5), joint_limit_revolute=(-np.pi, np.pi)):
         """
         Initialize the kinematic chain for the robot.
 
@@ -134,8 +134,7 @@ class KinematicChainPyBullet(KinematicChainBase):
         self.is_built = False
         self.is_loaded = False
 
-        self.default_joint_config = [0.0] * self.num_joints
-
+        self.default_joint_config = None
         self.pose_errors_compiled = []
         self.target_joint_positions_compiled = []
         self.rrt_path_costs_compiled = []
