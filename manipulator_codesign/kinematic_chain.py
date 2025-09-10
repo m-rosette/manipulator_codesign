@@ -162,31 +162,11 @@ class KinematicChainPyBullet(KinematicChainBase):
                                ee_link_name=self.ee_link_name,
                                collision_objects=self.collision_objects)
         self.is_loaded = True
+        self.num_joints = len(self.robot.controllable_joint_idx)
+        self.joint_limits = self.robot.joint_limits
 
         # Initialize motion planner
         self.motion_planner = KinematicChainMotionPlanner(self.robot)
-
-    # def sample_collision_free_poses(self, pose_candidates):
-    #     target_poses = []
-
-    #     for target_candidate in pose_candidates:
-    #         for j, target_pose in enumerate(target_candidate):
-    #             target_pose = tuple(target_pose)
-    #             joint_config = self.robot.inverse_kinematics(target_pose)
-    #             self.robot.reset_joint_positions(joint_config)
-    #             if not self.robot.collision_check(self.robot.robotId, self.collision_objects):
-    #                 target_poses.append(target_pose)
-    #                 break
-    #         else:
-    #             # If we never `break`, no collision-free orientation was found.
-    #             # Use the last pose's position but a default “front-facing (+y)” quaternion.
-    #             last_pose = target_candidate[-1]
-    #             pos = np.asarray(last_pose[0])
-    #             default_quat = R.from_euler('xyz', [90, 0, 180], degrees=True).as_quat()
-    #             fallback = (pos, default_quat)
-    #             target_poses.append(fallback)
-
-    #     return target_poses
 
     def sample_collision_free_poses(self, pose_candidates, ik_round_decimals=3):
         """

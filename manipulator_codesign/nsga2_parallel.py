@@ -46,17 +46,19 @@ class Evaluator:
     items: list of tuples (x, targets, targets_offset, robot_translations, mobile_base_translations,
                           min_j, max_j, alpha, beta, delta, gamma)
     """
-    def __init__(self, mesh_path: str, robot_urdf: str, flags: int):
+    def __init__(self, mesh_path: str, robot_urdf: str, flags: int, sim_dt: float = 0.02):
         # local import so actor process has pybullet available even if driver env differs
         import pybullet as p, pybullet_data
         self.p = p
         self.pybullet_data = pybullet_data
         self.robot_urdf = robot_urdf
         self.flags = flags
+        self.sim_dt = sim_dt
         # create one DIRECT client for this actor process
         self._cid = p.connect(p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81)
+        p.setTimeStep(self.sim_dt)
 
         # NOTE: Original code created a collision shape once in __init__.
         # many pybullet users find that resetSimulation invalidates handles, so
@@ -192,7 +194,8 @@ class KinematicChainProblem(Problem):
     def __init__(self, targets, targets_offset, robot_translation, mobile_base_translation,
                  seeds, dec_vec_bounds, min_joints=2, max_joints=7,
                  alpha=1, beta=1, delta=1, gamma=1,
-                 cal_samples=15, num_actors=4, num_objectives=6):
+                 cal_samples=15, num_actors=4, num_objectives=6,
+                 cal_target_samples=5, cal_downsample_seed=None):
         print("[KinematicChainProblem] Initializing and calibrating...")
         self.targets = targets
         self.targets_offset = targets_offset
@@ -203,6 +206,11 @@ class KinematicChainProblem(Problem):
 
         xl = dec_vec_bounds[0]
         xu = dec_vec_bounds[1]
+
+        # number of poses to use during calibration for targets/targets_offset (default 5)
+        self.cal_target_samples = int(cal_target_samples)
+        # optional seed for reproducible random downsampling; set to None for non-deterministic
+        self.cal_downsample_seed = cal_downsample_seed
 
         super().__init__(n_var=len(xl), n_obj=num_objectives, xl=np.array(xl), xu=np.array(xu))
 
@@ -219,7 +227,8 @@ class KinematicChainProblem(Problem):
             Evaluator.options(max_concurrency=1).remote(
                 mesh_path,
                 robot_urdf,
-                flags
+                flags,
+                sim_dt=0.02
             )
             for _ in range(num_actors)
         ]
@@ -242,6 +251,21 @@ class KinematicChainProblem(Problem):
             return np.vstack([X_seeded, X_rand])
         else:
             return X_seeded
+        
+    def _maybe_random_downsample(self, poses, max_samples):
+        """
+        If poses contains more than max_samples, randomly downsample to exactly max_samples.
+        Uses numpy's PCG64 via default_rng. If self.cal_downsample_seed is set, sampling is reproducible.
+        """
+        if poses is None:
+            return poses
+        n = len(poses)
+        if n <= max_samples:
+            return poses
+        rng = np.random.default_rng(self.cal_downsample_seed)
+        idx = rng.choice(n, size=max_samples, replace=False)
+        idx.sort()
+        return [poses[i] for i in idx]
 
     def _parallel_calibration(self):
         print("[Calibration] Running parallel calibration samples...")
@@ -249,8 +273,17 @@ class KinematicChainProblem(Problem):
         location_idx = 0
         robot_translation = [self.robot_translation[location_idx]]
         mobile_base_translation = [self.mobile_base_translation[location_idx]]
-        targets = [self.targets[location_idx]]
-        targets_offset = [self.targets_offset[location_idx]]
+
+        # original full lists for the location
+        targets_full = self.targets[location_idx]
+        targets_offset_full = self.targets_offset[location_idx]
+
+        # if > cal_target_samples, randomly downsample to cal_target_samples
+        targets_ds = self._maybe_random_downsample(targets_full, self.cal_target_samples)
+        targets_offset_ds = self._maybe_random_downsample(targets_offset_full, self.cal_target_samples)
+
+        targets = [targets_ds]
+        targets_offset = [targets_offset_ds]
 
         # Prepare items for evaluate_batch
         items = []
@@ -286,6 +319,8 @@ class KinematicChainProblem(Problem):
         self.delta_bounds  = bounds([r['delta_joint_score_rrmc'] for r in res])
         self.pos_bounds    = bounds([r['pos_error_rrmc'] for r in res])
         self.jcount_bounds = bounds([r['joint_count'] for r in res])
+
+        print("[Calibration] Completed. Starting real evaluations now...")
 
     def _evaluate(self, X, out, *args, **kwargs):
         # Prepare batched items for each decision vector in X
