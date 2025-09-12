@@ -287,7 +287,7 @@ class KinematicChainPyBullet(KinematicChainBase):
         self.ori_errors_rrmc_compiled.extend(flat_ori_err.tolist())
 
         # Compute the Global Conditioning Index (GCI) for the kinematic chain.
-        global_conditioning_index = self.compute_global_conditioning_index(num_samples=50)
+        global_conditioning_index = self.compute_global_conditioning_index(num_samples=10)
         self.global_conditioning_index_compiled.append(global_conditioning_index)
 
     def compute_chain_metric_stats(self):

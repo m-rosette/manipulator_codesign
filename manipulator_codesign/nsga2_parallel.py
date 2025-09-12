@@ -21,6 +21,7 @@ import time
 import numpy as np
 import ray
 import wandb
+from typing import Callable, List, Sequence
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
@@ -35,7 +36,7 @@ from manipulator_codesign.urdf_to_decision_vector import load_seeds
 from manipulator_codesign.kinematic_chain import KinematicChainPyBullet
 import manipulator_codesign.orchard_workspace as orchard_ws
 from pybullet_robokit.load_objects import LoadObjects
-from nsga2_callbacks import CombinedCallback, WandbLogger, CheckpointCallback
+from nsga2_callbacks import CombinedCallback, WandbLogger, CheckpointCallback, FidelityCallback
 
 
 # -------- Ray Actor for Persistent Evaluation (batched) --------
@@ -195,7 +196,8 @@ class KinematicChainProblem(Problem):
                  seeds, dec_vec_bounds, min_joints=2, max_joints=7,
                  alpha=1, beta=1, delta=1, gamma=1,
                  cal_samples=15, num_actors=4, num_objectives=6,
-                 cal_target_samples=5, cal_downsample_seed=None):
+                 cal_target_samples=5, cal_downsample_seed=None,
+                 fidelity_schedule: Callable[[int], int] = None, max_generation=None):
         print("[KinematicChainProblem] Initializing and calibrating...")
         self.targets = targets
         self.targets_offset = targets_offset
@@ -203,6 +205,30 @@ class KinematicChainProblem(Problem):
         self.mobile_base_translation = np.asarray(mobile_base_translation, dtype=float)
         self.min_joints, self.max_joints = min_joints, max_joints
         self.alpha, self.beta, self.delta, self.gamma = alpha, beta, delta, gamma
+
+        self.current_generation = 0
+        # keep the full-per-location targets for later use
+        self._full_targets = self.targets
+        self._full_targets_offset = self.targets_offset
+
+        # Save user-provided schedule or create default later
+        self._fidelity_schedule = fidelity_schedule
+        self._total_generations = max_generation  # optional; can be None
+
+        # If user didn't pass a schedule, create a default linear ramp from small -> full
+        if self._fidelity_schedule is None:
+            # default: start with min(3, full_count) and linearly ramp to full_count
+            def default_schedule(gen: int):
+                full_count = max(len(loc) for loc in self._full_targets)
+                start = min(3, full_count)
+                if self._total_generations and self._total_generations > 1:
+                    frac = min(1.0, gen / max(1, self._total_generations - 1))
+                else:
+                    frac = 1.0
+                # linear ramp
+                n = int(round(start + (full_count - start) * frac))
+                return max(1, min(full_count, n))
+            self._fidelity_schedule = default_schedule
 
         xl = dec_vec_bounds[0]
         xu = dec_vec_bounds[1]
@@ -322,12 +348,51 @@ class KinematicChainProblem(Problem):
 
         print("[Calibration] Completed. Starting real evaluations now...")
 
+    def _downsample_targets_for_generation(self, generation: int):
+        """
+        Deterministically downsample full targets for each location based on generation.
+        Returns (targets_ds_list, targets_offset_ds_list) where each is a list of lists matching original shape.
+        """
+        full_targets = self._full_targets
+        full_offsets = self._full_targets_offset
+
+        # how many poses per location to sample for this generation
+        num_samples = self._fidelity_schedule(generation)
+
+        targets_ds = []
+        offsets_ds = []
+
+        for location_idx, (loc_targets, loc_offsets) in enumerate(zip(full_targets, full_offsets)):
+            # if either is None or count <= requested, keep as-is
+            def pick(poses):
+                if poses is None:
+                    return poses
+                n = len(poses)
+                if n <= num_samples:
+                    return poses
+                # seed the rng deterministically using seed + generation + location to ensure
+                # same sample for all evaluations within this generation
+                seed = (self.cal_downsample_seed or 0) ^ (generation + 1) ^ (location_idx << 16)
+                rng = np.random.default_rng(seed)
+                idx = rng.choice(n, size=num_samples, replace=False)
+                idx.sort()
+                return [poses[i] for i in idx]
+
+            targets_ds.append(pick(loc_targets))
+            offsets_ds.append(pick(loc_offsets))
+
+        return targets_ds, offsets_ds
+
     def _evaluate(self, X, out, *args, **kwargs):
+        # Obtain downsampled targets for the current generation
+        targets_ds, targets_offset_ds = self._downsample_targets_for_generation(self.current_generation)
+
         # Prepare batched items for each decision vector in X
         items = []
         for i in range(X.shape[0]):
             items.append((
-                X[i], self.targets, self.targets_offset,
+                # X[i], self.targets, self.targets_offset,
+                X[i], targets_ds, targets_offset_ds,
                 self.robot_translation, self.mobile_base_translation,
                 self.min_joints, self.max_joints,
                 self.alpha, self.beta, self.delta, self.gamma
@@ -403,9 +468,9 @@ if __name__ == "__main__":
     min_joints = args.min_joints
     max_joints = args.max_joints
 
-    joint_type_bounds = (0, 2)  # 0: revolute, 1: prismatic, 2: fixed
-    joint_axis_bounds = (0, 2)
-    link_length_bounds = (0.05, 0.75)
+    joint_type_bounds = (0, 2)  # 0: revolute, 1: prismatic, 2: spherical
+    joint_axis_bounds = (0, 2)  # 0: x, 1: y, 2: z
+    link_length_bounds = (0.05, 0.75) # min, max
 
     num_generations = args.generations
     num_population = args.population
@@ -413,7 +478,8 @@ if __name__ == "__main__":
     num_objectives = 6
 
     # choose number of actors based on available CPUs
-    available_cpus = os.cpu_count() or 1
+    # available_cpus = os.cpu_count() or 1
+    available_cpus = 2
     num_actors = max(1, available_cpus)  # you can tune this: set smaller if you want fewer processes
     print(f"[main] available_cpus={available_cpus}, num_actors={num_actors}")
 
@@ -422,7 +488,8 @@ if __name__ == "__main__":
 
     robot_to_amiga_translation = [0, 0, 1.025]
     amiga_to_robot_translation = [0, -0.3, 0]
-    robot_system_locations = [[-4.0, -2.25, 0.0], [-1.5, -2.25, 0.0], [1.0, -2.25, 0.0], [3.5, -2.25, 0.0], [6.0, -2.25, 0.0]]
+    # robot_system_locations = [[-4.0, -2.25, 0.0], [-1.5, -2.25, 0.0], [1.0, -2.25, 0.0], [3.5, -2.25, 0.0], [6.0, -2.25, 0.0]]
+    robot_system_locations = [[-1.5, -2.25, 0.0]]
 
     window_x_positions = [loc[0] for loc in robot_system_locations]
     window_size = 2.5
@@ -476,7 +543,38 @@ if __name__ == "__main__":
         num_objectives=num_objectives,
     )
 
-    callback = CheckpointCallback(out_dir=data_dir, every=1, keep_last=5)
+    checkpoint_cb = CheckpointCallback(out_dir=data_dir, every=1, keep_last=5)
+
+    def linear_schedule_factory(min_samples: int, max_samples: int, total_gens: int) -> Callable[[int], int]:
+        def schedule(gen: int):
+            if total_gens <= 1:
+                return max_samples
+            frac = min(1.0, gen / max(1, total_gens - 1))
+            return int(round(min_samples + (max_samples - min_samples) * frac))
+        return schedule
+
+    # after problem is constructed, set schedule and create fidelity callback
+    full_count = max(len(loc) for loc in target_poses_list)  # per-location max
+    min_samples = 3
+    schedule = linear_schedule_factory(min_samples, full_count, num_generations)
+
+    # assign schedule into problem (so it uses this schedule)
+    problem._fidelity_schedule = schedule
+    problem._total_generations = num_generations
+
+    # create fidelity callback and chain with existing callbacks
+    fidelity_cb = FidelityCallback(problem)
+
+    # assemble only these two, ensuring checkpoint runs before fidelity
+    if checkpoint_cb is not None and fidelity_cb is not None:
+        # order matters: checkpoint -> fidelity (fidelity increments for next generation)
+        callback = CombinedCallback(checkpoint_cb, fidelity_cb)
+    elif checkpoint_cb is not None:
+        callback = checkpoint_cb
+    elif fidelity_cb is not None:
+        callback = fidelity_cb
+    else:
+        callback = None
 
     if use_wandb:
         api_key = os.environ.get("WANDB_API_KEY")

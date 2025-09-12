@@ -3,15 +3,30 @@ import pickle
 import tempfile
 import wandb
 import numpy as np
+from typing import Optional, Any
 from pymoo.core.callback import Callback
 
 
 # -------- Combined Callback --------
 class CombinedCallback(Callback):
     def __init__(self, *callbacks):
+        super().__init__()
         self.callbacks = callbacks
+
     def notify(self, algorithm):
-        for c in self.callbacks: c.notify(algorithm)
+        for c in self.callbacks:
+            # prefer notify method if present, otherwise call if callable
+            if hasattr(c, "notify"):
+                try:
+                    c.notify(algorithm)
+                    continue
+                except Exception:
+                    pass
+            if callable(c):
+                try:
+                    c(algorithm)
+                except Exception:
+                    pass
 
 
 # -------- W&B Callback --------
@@ -83,3 +98,27 @@ class CheckpointCallback(Callback):
                     os.remove(os.path.join(self.out_dir, files.pop(0)))
 
         self.gen += 1
+
+class FidelityCallback(Callback):
+    """
+    pymoo-style Callback that increments problem.current_generation once per generation.
+    Accepts the problem instance but does not import its type to avoid circular imports.
+    """
+    def __init__(self, problem: Any):
+        super().__init__()
+        self.problem = problem
+        # ensure attribute exists
+        if not hasattr(self.problem, "current_generation"):
+            try:
+                setattr(self.problem, "current_generation", 0)
+            except Exception:
+                pass
+
+    def notify(self, algorithm):
+        try:
+            # increment for next generation
+            current = getattr(self.problem, "current_generation", 0)
+            setattr(self.problem, "current_generation", current + 1)
+        except Exception as e:
+            print("FidelityCallback.notify error:", e)
+            pass
