@@ -478,8 +478,7 @@ if __name__ == "__main__":
     num_objectives = 6
 
     # choose number of actors based on available CPUs
-    # available_cpus = os.cpu_count() or 1
-    available_cpus = 2
+    available_cpus = os.cpu_count() or 1
     num_actors = max(1, available_cpus)  # you can tune this: set smaller if you want fewer processes
     print(f"[main] available_cpus={available_cpus}, num_actors={num_actors}")
 
