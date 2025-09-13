@@ -230,7 +230,7 @@ def encode_seed(dec_vec: Tuple[int, List[str], List[Tuple[float, float, float]],
 # URDF -> decision vector main export
 # --------------------------
 
-def urdf_to_decision_vector(urdf_path: str, fallback_length: float = 0.25) -> Tuple[int, List[str], List[Tuple[float, float, float]], List[float]]:
+def urdf_to_decision_vector(urdf_path: str, fallback_length: float = 0.25, ee_link_name='end_effector') -> Tuple[int, List[str], List[Tuple[float, float, float]], List[float]]:
     """
     Load URDF into pybullet via LoadRobot, detect controllable joints (including spherical triplets),
     and return (n_controllable, types, axes, lengths).
@@ -250,7 +250,7 @@ def urdf_to_decision_vector(urdf_path: str, fallback_length: float = 0.25) -> Tu
         con.getQuaternionFromEuler([0, 0, 0]),
         home_config=None,
         collision_objects=[],
-        ee_link_name='end_effector',
+        ee_link_name=ee_link_name,
     )
 
     # parse cylinder lengths once

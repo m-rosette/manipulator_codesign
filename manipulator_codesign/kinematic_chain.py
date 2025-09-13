@@ -108,7 +108,7 @@ class KinematicChainBase:
 
 # --- PyBullet Implementation ---
 class KinematicChainPyBullet(KinematicChainBase):
-    def __init__(self, pyb_con, start_position, num_joints, joint_types, joint_axes, link_lengths, ee_link_name='end_effector', collision_objects=[], **kwargs):
+    def __init__(self, pyb_con, start_position, num_joints, joint_types, joint_axes, link_lengths, ee_link_name='end_effector', collision_objects=[], ik_tol=0.01, max_ik_iter=200, **kwargs):
         """
         pyb_con: A connection object from your PyBullet utilities.
         """
@@ -119,6 +119,7 @@ class KinematicChainPyBullet(KinematicChainBase):
         self.urdf_path = None
         self.robot = None
         self.collision_objects = collision_objects
+        self.max_ik_iter = max_ik_iter
 
         self.mean_pose_error = None
         self.mean_torque = None
@@ -145,6 +146,12 @@ class KinematicChainPyBullet(KinematicChainBase):
         self.ori_errors_rrmc_compiled = []
         self.global_conditioning_index_compiled = []
 
+        # IK tolerance used to decide if a pose is reachable
+        self.ik_tol = ik_tol
+        # reachable counts for the last compute_chain_metrics run
+        self.num_reachable_targets = 0
+        self.reachable_fraction = 0.0
+
     def build_robot(self):
         # Create a URDF for this chain.
         self.create_urdf()
@@ -162,6 +169,7 @@ class KinematicChainPyBullet(KinematicChainBase):
                                ee_link_name=self.ee_link_name,
                                collision_objects=self.collision_objects)
         self.is_loaded = True
+        self.num_logical_joints = self.num_joints
         self.num_joints = len(self.robot.controllable_joint_idx)
         self.joint_limits = self.robot.joint_limits
 
@@ -252,6 +260,10 @@ class KinematicChainPyBullet(KinematicChainBase):
         pose_errors, self.target_joint_positions = zip(*[self.compute_pose_fitness(target) for target in targets_offset])
         self.pose_errors_compiled.extend(pose_errors)
 
+        # count how many are within IK tolerance
+        self.num_reachable_targets = int(sum(1 for e in pose_errors if e <= self.ik_tol))
+        self.reachable_fraction = self.num_reachable_targets / max(1, len(pose_errors))
+
         # Compute the rrt path cost for the target joint positions with the tree collision mesh.
         rrt_path_costs = [self.compute_rrt_path_cost(joint_positions, collision_objects=self.collision_objects) for joint_positions in self.target_joint_positions]
         self.rrt_path_costs_compiled.extend(rrt_path_costs)
@@ -334,7 +346,7 @@ class KinematicChainPyBullet(KinematicChainBase):
                IK computation, a large fitness value (1e6) is returned.
         """
         # Step 4: Compute IK
-        joint_config = self.robot.inverse_kinematics(target_pose, pos_tol=0.01, rest_config=self.robot.home_config, max_iter=200)
+        joint_config = self.robot.inverse_kinematics(target_pose, pos_tol=self.ik_tol, rest_config=self.robot.home_config, max_iter=self.max_ik_iter)
         
         # drive the robot to that config (for measurement)
         self.robot.reset_joint_positions(joint_config)
@@ -348,7 +360,7 @@ class KinematicChainPyBullet(KinematicChainBase):
             current_ori=ee_ori,
             target_pos=target_pos,
             target_ori=target_quat,
-            tol=0.0
+            tol=self.ik_tol
             )
             # e.g. weight orientation half as much as position
             total_error = pos_err_norm + ori_err_angle
